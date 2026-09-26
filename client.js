@@ -887,8 +887,8 @@ window.__ModuleLoader__.load({
                   value:
                     extra.unit === 'money'
                       ? decimal(extra.value, 2)
-                      : extra.unit === 'count'
-                        ? plain(extra.value)
+                      : extra.unit === 'percent'
+                        ? percent(extra.value)
                         : plain(extra.value),
                 }),
               ),

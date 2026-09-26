@@ -246,6 +246,39 @@ check('commandcode parses 5h / weekly / monthly', commandcode?.status === 'ok' &
 check('commandcode plan resolved', commandcode?.planName === 'GOAT', String(commandcode?.planName));
 check('every window carries a reset instant', [...(kimi?.windows ?? []), ...(commandcode?.windows ?? [])].every((w) => typeof w.resetAt === 'number'));
 
+// Command Code meters in money, but its per-model money caps differ, so the panel
+// reports the spent share instead: no commandcode figure may be a currency amount.
+const ccWindows = commandcode?.windows ?? [];
+check(
+  'commandcode windows are quota shares, not money',
+  ccWindows.length === 3 && ccWindows.every((w) => w.unit === 'percent' && w.used >= 0 && w.used <= 1),
+  JSON.stringify(ccWindows.map((w) => [w.id, w.unit, w.used])),
+);
+const near = (a, b) => typeof a === 'number' && Math.abs(a - b) < 1e-6;
+const ccWindow = (id) => ccWindows.find((w) => w.id === id);
+check('commandcode 5h share = 0.44 / 14', near(ccWindow('5h')?.used, 0.44 / 14), String(ccWindow('5h')?.used));
+check('commandcode weekly share = 9.5 / 35', near(ccWindow('7d')?.used, 9.5 / 35), String(ccWindow('7d')?.used));
+// The allowance is spent + remaining (22.05 + 48.04 = 70.09), which is exact for
+// any plan; the published 70 would skew the share, so it must not be used here.
+check(
+  'commandcode monthly share is derived from spent + remaining (70.09)',
+  near(ccWindow('monthTotal')?.used, 22.05 / 70.09),
+  String(ccWindow('monthTotal')?.used),
+);
+const ccExtras = commandcode?.extras ?? [];
+check(
+  'commandcode extras are shares, not money',
+  ccExtras.every((e) => e.unit !== 'money') &&
+    ccExtras.some((e) => e.label === '本周期剩余' && e.unit === 'percent' && near(e.value, 48.04 / 70.09)) &&
+    ccExtras.some((e) => e.label === '加量额度' && e.unit === 'percent' && near(e.value, 0)),
+  JSON.stringify(ccExtras),
+);
+check(
+  'kimi keeps its money balance (only commandcode is share-based)',
+  (kimi?.extras ?? []).every((e) => e.unit !== 'percent'),
+  JSON.stringify(kimi?.extras),
+);
+
 // ---------------------------------------------------------------------------
 // B. Browser half
 // ---------------------------------------------------------------------------

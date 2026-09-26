@@ -1,6 +1,6 @@
 {
   "name": "@local/dsh-usage",
-  "version": "1.1.0",
+  "version": "1.2.0",
   "private": true,
   "type": "module",
   "description": "用量 · Usage — DeepSeek Harness (DSH) 设置面板：当日与累计的 token 用量、缓存命中、历史日历，以及已接入 API（kimi-coding、commandcode）的额度与刷新时间。 A DSH settings panel for token usage, cache hits, a history calendar, and provider quotas.",

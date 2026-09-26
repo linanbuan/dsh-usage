@@ -456,6 +456,24 @@ function finite(value) {
 }
 
 /**
+ * The spent share of a metered window, as a 0-1 ratio.
+ *
+ * Command Code meters its windows in money, but the balance it reports is not
+ * comparable across models: each model is capped at its own dollar figure, so
+ * the same "US$48 left" buys a different amount of work per model, and the
+ * window caps the API returns are account-wide sums of those per-model limits.
+ * The share already spent is the invariant, so that is what gets reported.
+ *
+ * @param {unknown} used
+ * @param {unknown} cap
+ * @returns {number|undefined} 0-1, or undefined when no ratio is derivable.
+ */
+function share(used, cap) {
+  if (used === undefined || cap === undefined || cap <= 0) return undefined
+  return Math.max(0, used / cap)
+}
+
+/**
  * @param {unknown} value an ISO timestamp.
  * @returns {number|undefined} epoch milliseconds.
  */
@@ -577,13 +595,14 @@ function parseCommandCode(credits, subscription, summary) {
   const window = (entry, id, label) => {
     const used = finite(entry?.used)
     const cap = finite(entry?.cap)
-    if (used === undefined || cap === undefined) return
+    const spent = share(used, cap)
+    if (spent === undefined) return
     windows.push({
       id,
       label,
-      unit: 'credit',
-      used,
-      cap,
+      unit: 'percent',
+      used: spent,
+      cap: 1,
       resetAt: finite(entry?.resetAt),
       exceeded: entry?.exceeded === true,
     })
@@ -595,24 +614,32 @@ function parseCommandCode(credits, subscription, summary) {
   const planCap = planId === undefined ? undefined : COMMANDCODE_PLAN_TOTALS[planId]
   const periodUsed = finite(summary?.totalMonthlyCredits)
   const remaining = finite(credits?.credits?.monthlyCredits)
-  const used =
-    periodUsed ?? (planCap !== undefined && remaining !== undefined ? Math.max(0, planCap - remaining) : undefined)
-  if (used !== undefined) {
+  // The plan's own allowance is whatever has been spent plus whatever is left of
+  // it, which holds for every plan and needs no price table; the published total
+  // is only a fallback for a payload that withholds the remaining figure.
+  const allowance =
+    periodUsed !== undefined && remaining !== undefined ? periodUsed + remaining : planCap
+  const spent = periodUsed ?? (allowance === undefined || remaining === undefined ? undefined : allowance - remaining)
+  const spentShare = share(spent, allowance)
+  if (spentShare !== undefined) {
     windows.push({
       id: 'monthTotal',
       label: '总额度（本计费周期）',
-      unit: 'credit',
-      used,
-      cap: planCap,
+      unit: 'percent',
+      used: spentShare,
+      cap: 1,
       resetAt: instant(subscription?.currentPeriodEnd),
       exceeded: credits?.credits?.belowThreshold === true && remaining === 0,
     })
   }
 
   const extras = []
-  if (remaining !== undefined) extras.push({ label: '本周期剩余额度', value: remaining, unit: 'money' })
-  if (finite(credits?.credits?.purchasedCredits) !== undefined) {
-    extras.push({ label: '加量额度', value: finite(credits.credits.purchasedCredits), unit: 'money' })
+  const leftShare = share(remaining, allowance)
+  if (leftShare !== undefined) extras.push({ label: '本周期剩余', value: leftShare, unit: 'percent' })
+  const purchased = finite(credits?.credits?.purchasedCredits)
+  if (purchased !== undefined) {
+    const purchasedShare = share(purchased, allowance)
+    if (purchasedShare !== undefined) extras.push({ label: '加量额度', value: purchasedShare, unit: 'percent' })
   }
   if (finite(summary?.totalTokensIn) !== undefined) {
     extras.push({ label: '输入 token', value: finite(summary.totalTokensIn), unit: 'tokens' })

@@ -42,9 +42,11 @@ HMR. To switch it off, override the row in the profile's own `cordis.patch.yml`:
 |---|---|
 | Today / All time | Total usage and cache hits, plus input / output / cache-write / billed-call detail |
 | History | A month calendar whose cells draw two proportional bars per day (total usage, cache hits); pick a day for its exact figures; step through months |
-| API quotas | `kimi-coding` (5-hour window, monthly total) and `commandcode` (5-hour, weekly, monthly) usage, caps and reset times |
+| API quotas | `kimi-coding` (5-hour window, monthly total) and `commandcode` (5-hour, weekly, monthly) used share and reset times |
 
 Token counts are always shown as **complete integers** — never abbreviated to `K` / `M` / `B`.
+
+`commandcode` is reported as a **percentage**, never as an amount: each of its models has its own dollar cap, so the same "US$48 left" buys a different amount of work per model and the figure is not comparable. The share of a window already spent is, so that is all the panel reports. The billing-period allowance is derived on the spot from **spent + remaining** (true for any plan), falling back to the published price table only when the API withholds the remaining figure; `kimi-coding` returns ratios itself and is unchanged.
 
 ![API quotas](docs/panel-quota.png)
 
