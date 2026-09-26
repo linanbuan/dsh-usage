@@ -1,0 +1,7 @@
+# Dependencies are installed by the harness profile, never by this repo.
+node_modules/
+
+# Local logs and editor/OS droppings.
+*.log
+.DS_Store
+Thumbs.db
