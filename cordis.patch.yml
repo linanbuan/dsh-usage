@@ -1,0 +1,13 @@
+# 用量 (Usage) bundle patch.
+#
+# One insert over the profile's entry list: the host half mounts there, and its
+# `dsh.client` declaration is what pulls the browser half into the boot graph.
+# The row id is what a profile's own cordis.patch.yml targets to disable or
+# retune the panel:
+#
+#   - id: usage-panel
+#     disabled: true
+
+- insert:
+    - id: usage-panel
+      name: '@local/dsh-usage'

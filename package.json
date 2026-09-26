@@ -1,0 +1,70 @@
+{
+  "name": "@local/dsh-usage",
+  "version": "1.1.0",
+  "private": true,
+  "type": "module",
+  "description": "用量 · Usage — DeepSeek Harness (DSH) 设置面板：当日与累计的 token 用量、缓存命中、历史日历，以及已接入 API（kimi-coding、commandcode）的额度与刷新时间。 A DSH settings panel for token usage, cache hits, a history calendar, and provider quotas.",
+  "icon": "./icon.svg",
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/linanbuan/dsh-usage.git"
+  },
+  "homepage": "https://github.com/linanbuan/dsh-usage#readme",
+  "bugs": {
+    "url": "https://github.com/linanbuan/dsh-usage/issues"
+  },
+  "keywords": [
+    "deepseek-harness",
+    "dsh",
+    "dsh-plugin",
+    "deepseek",
+    "usage",
+    "token-usage",
+    "cache-hit",
+    "quota",
+    "settings-panel",
+    "kimi-coding",
+    "commandcode"
+  ],
+  "exports": {
+    ".": "./index.js",
+    "./client": "./client.js",
+    "./package.json": "./package.json",
+    "./icon.svg": "./icon.svg",
+    "./locale/*.json": "./locale/*.json"
+  },
+  "files": [
+    "index.js",
+    "client.js",
+    "cordis.patch.yml",
+    "icon.svg",
+    "locale/*.json",
+    "README.md",
+    "README.en.md",
+    "LICENSE",
+    "docs/*.png",
+    "test/*.mjs"
+  ],
+  "scripts": {
+    "test": "node test/selfcheck.mjs"
+  },
+  "engines": {
+    "node": ">=20"
+  },
+  "dsh": {
+    "bundle": {
+      "patch": "./cordis.patch.yml"
+    },
+    "client": {
+      "platform": "web",
+      "immediately": true,
+      "inject": [
+        "@deepseek-ai/dsh-client-ui-settings"
+      ]
+    }
+  },
+  "peerDependencies": {
+    "@deepseek-ai/cordis": "^4.0.1"
+  }
+}
