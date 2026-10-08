@@ -100,8 +100,8 @@ check('usage degrades to available:false', payload.usage?.available === false);
 check('all-time totals are numeric zeros', payload.usage?.totals?.total === 0 && payload.usage?.totals?.cacheRead === 0);
 check('today bucket exists', typeof payload.usage?.today?.date === 'string');
 check(
-  'both providers report no-key (never throw)',
-  (payload.quota?.providers ?? []).length === 2 &&
+  'all three providers report no-key (never throw)',
+  (payload.quota?.providers ?? []).length === 3 &&
     (payload.quota?.providers ?? []).every((provider) => provider.status === 'no-key'),
 );
 check('a time zone is reported', typeof payload.timeZone === 'string' && payload.timeZone.length > 0);
@@ -138,17 +138,27 @@ services.sessionPersistence = {
 };
 services.credentials = {
   async resolve(ref) {
-    return { value: ref === 'KIMI_CODING_API_KEY' ? 'kimi-key' : ref === 'COMMANDCODE_API_KEY' ? 'cc-key' : undefined };
+    return ref === 'KIMI_CODING_API_KEY'
+      ? { value: 'kimi-key' }
+      : ref === 'COMMANDCODE_API_KEY'
+        ? { value: 'cc-key' }
+        : ref === 'OPENCODEGO_API_KEY'
+          ? { value: 'oc-key' }
+          : undefined;
   },
 };
 // The providers are unreachable offline, so the parsers are exercised directly
 // through a stubbed fetch that answers the real payload shapes. Each call also
-// sleeps, which is what lets the checks below prove the four requests overlap:
+// sleeps, which is what lets the checks below prove the five requests overlap:
 // on this machine one provider round trip is seconds, so paying it once instead
 // of twice is the whole point of the parallel rewrite.
 const DELAY_MS = 200;
 const providerCalls = [];
 const realFetch = globalThis.fetch;
+const timeoutError = () => Object.assign(new Error('the operation was aborted due to timeout'), { name: 'TimeoutError' });
+/** 'ok' | 'retry-once' | 'always-timeout': how the kimi read answers this round. */
+let kimiMode = 'ok';
+const kimiCalls = [];
 globalThis.fetch = async (url) => {
   const target = String(url);
   providerCalls.push(target);
@@ -169,7 +179,22 @@ globalThis.fetch = async (url) => {
     return new Response(JSON.stringify({ totalCount: 11, totalTokensIn: 100, totalTokensOut: 20, totalMonthlyCredits: 22.05 }), { status: 200 });
   }
   if (target.includes('/coding/v1/usages')) {
+    kimiCalls.push(target);
+    if (kimiMode === 'always-timeout') throw timeoutError();
+    if (kimiMode === 'retry-once' && kimiCalls.length === 1) throw timeoutError();
     return new Response(JSON.stringify({ usages: { limit_5h: { used_ratio: 0, reset_time: new Date(Date.now() + 3_600_000).toISOString() }, limit_month_code: { used_ratio: 0.1255, reset_time: new Date(Date.now() + 86_400_000).toISOString() }, limit_month_total: { used_ratio: 0.1255, reset_time: new Date(Date.now() + 86_400_000).toISOString() } } }), { status: 200 });
+  }
+  if (target === 'https://opencode.ai/zen/go/v1/usage') {
+    return new Response(
+      JSON.stringify({
+        usage: {
+          rolling: { status: 'ok', percent: 5, resetsAt: new Date(Date.now() + 3_600_000).toISOString() },
+          weekly: { status: 'ok', percent: 25, resetsAt: new Date(Date.now() + 3 * 86_400_000).toISOString() },
+          monthly: { status: 'ok', percent: 63.5, resetsAt: new Date(Date.now() + 30 * 86_400_000).toISOString() },
+        },
+      }),
+      { status: 200 },
+    );
   }
   throw new Error(`unexpected fetch: ${target}`);
 };
@@ -182,8 +207,8 @@ const secondPayload = await second.json();
 const quotaElapsed = Date.now() - usageStarted;
 
 check(
-  'all four provider reads overlap (one round trip, not two serialized groups)',
-  providerCalls.length === 4 && quotaElapsed < DELAY_MS * 3,
+  'all five provider reads overlap (one round trip, not two serialized groups)',
+  providerCalls.length === 5 && quotaElapsed < DELAY_MS * 3,
   `${String(providerCalls.length)} calls in ${String(quotaElapsed)}ms (serialized groups would need ${String(DELAY_MS * 4)}ms+)`,
 );
 
@@ -212,9 +237,72 @@ const cachedResponse = await quotaRoute.fetch(new Request('http://127.0.0.1/api/
 const cachedPayload = await cachedResponse.json();
 check(
   'a warm quota GET is a cache hit that does not block',
-  cachedPayload.quota?.providers?.length === 2 && cachedPayload.quota?.refreshing === false,
+  cachedPayload.quota?.providers?.length === 3 && cachedPayload.quota?.refreshing === false,
   JSON.stringify({ providers: cachedPayload.quota?.providers?.length, refreshing: cachedPayload.quota?.refreshing }),
 );
+// Resilience on a flaky path. Measured on this machine: api.commandcode.ai
+// normally answers in 230-900 ms, but produced a 10.5 s connect timeout and a
+// 9.4 s response in one afternoon — both past the old 8 s deadline, which is
+// what turned the card into 读取失败. So: one retry with a fresh deadline, and a
+// provider that stays down keeps its last good numbers instead of blanking.
+const quotaNow = async () => {
+  const response = await quotaRoute.fetch(
+    new Request('http://127.0.0.1/api/usage/quota', { headers: { accept: 'application/json', 'x-usage-force': '1' } }),
+  );
+  return (await response.json()).quota;
+};
+const kimiNow = (quota) => (quota.providers ?? []).find((provider) => provider.id === 'kimi-coding');
+
+kimiMode = 'retry-once';
+kimiCalls.length = 0;
+const retried = kimiNow(await quotaNow());
+check(
+  'a timed-out provider read is retried once with a fresh deadline',
+  kimiCalls.length === 2 && retried?.status === 'ok' && retried?.stale !== true,
+  `${String(kimiCalls.length)} attempt(s), status ${String(retried?.status)}`,
+);
+
+const goodFetchedAt = retried.fetchedAt;
+kimiMode = 'always-timeout';
+kimiCalls.length = 0;
+const staleQuota = await quotaNow();
+const staleKimi = kimiNow(staleQuota);
+check(
+  'a provider that stays down keeps its last good windows',
+  kimiCalls.length === 2 && staleKimi?.stale === true && staleKimi?.windows?.length === 2,
+  `${String(kimiCalls.length)} attempts, stale=${String(staleKimi?.stale)}, windows=${String(staleKimi?.windows?.length)}`,
+);
+check(
+  'the kept numbers are the previous round\u2019s, not silently recomputed',
+  staleKimi?.fetchedAt === goodFetchedAt,
+  `${String(staleKimi?.fetchedAt)} vs ${String(goodFetchedAt)}`,
+);
+check('the kept card still carries the failure reason', String(staleKimi?.message).includes('时限内'), String(staleKimi?.message));
+check(
+  'a failing provider does not stop the others from refreshing',
+  (staleQuota.providers ?? []).find((provider) => provider.id === 'commandcode')?.status === 'ok',
+  JSON.stringify((staleQuota.providers ?? []).map((provider) => [provider.id, provider.status])),
+);
+
+kimiMode = 'ok';
+const recovered = kimiNow(await quotaNow());
+check(
+  'the next successful round clears the stale flag',
+  recovered?.status === 'ok' && recovered?.stale !== true,
+  JSON.stringify({ status: recovered?.status, stale: recovered?.stale }),
+);
+
+// A configuration state must never be papered over with old numbers.
+const configured = services.credentials;
+services.credentials = { async resolve() { return undefined; } };
+const unconfigured = kimiNow(await quotaNow());
+services.credentials = configured;
+check(
+  'a removed key reports no-key instead of the last good numbers',
+  unconfigured?.status === 'no-key' && (unconfigured?.windows ?? []).length === 0,
+  JSON.stringify({ status: unconfigured?.status, windows: unconfigured?.windows?.length }),
+);
+
 globalThis.fetch = realFetch;
 void quotaElapsed;
 
@@ -235,6 +323,7 @@ check(
 const providers = secondPayload.quota?.providers ?? [];
 const kimi = providers.find((provider) => provider.id === 'kimi-coding');
 const commandcode = providers.find((provider) => provider.id === 'commandcode');
+const opencodeGo = providers.find((provider) => provider.id === 'opencode-go');
 // The host drops kimi's monthCode when it restates monthTotal, so the plan's
 // own shape arrives as 五小时 + 总额度.
 check(
@@ -244,7 +333,10 @@ check(
 );
 check('commandcode parses 5h / weekly / monthly', commandcode?.status === 'ok' && commandcode.windows.map((w) => w.id).join(',') === '5h,7d,monthTotal', JSON.stringify(commandcode?.windows?.map((w) => w.id)));
 check('commandcode plan resolved', commandcode?.planName === 'GOAT', String(commandcode?.planName));
-check('every window carries a reset instant', [...(kimi?.windows ?? []), ...(commandcode?.windows ?? [])].every((w) => typeof w.resetAt === 'number'));
+check(
+  'every window carries a reset instant',
+  [...(kimi?.windows ?? []), ...(commandcode?.windows ?? []), ...(opencodeGo?.windows ?? [])].every((w) => typeof w.resetAt === 'number'),
+);
 
 // Command Code meters in money, but its per-model money caps differ, so the panel
 // reports the spent share instead: no commandcode figure may be a currency amount.
@@ -278,6 +370,26 @@ check(
   (kimi?.extras ?? []).every((e) => e.unit !== 'percent'),
   JSON.stringify(kimi?.extras),
 );
+
+// OpenCode Go answers with each window's percent as-is, so the card shows the
+// three separate caps the plan's own accounting defines (5h / weekly / month).
+check(
+  'opencode-go parses rolling / weekly / monthly',
+  opencodeGo?.status === 'ok' && opencodeGo.windows.map((w) => w.id).join(',') === '5h,7d,monthTotal',
+  JSON.stringify(opencodeGo?.windows?.map((w) => w.id)),
+);
+const ocWindows = opencodeGo?.windows ?? [];
+check(
+  'opencode-go percent becomes a 0-1 ratio, with no currency extras',
+  ocWindows.length === 3 &&
+    ocWindows.every((w) => w.unit === 'percent' && w.used >= 0 && w.used <= 1) &&
+    (opencodeGo?.extras ?? []).length === 0 &&
+    opencodeGo?.plan === undefined,
+  JSON.stringify(ocWindows.map((w) => [w.id, w.unit, w.used])),
+);
+check('opencode-go rolling share = 5%', ocWindows.find((w) => w.id === '5h')?.used === 0.05, String(ocWindows.find((w) => w.id === '5h')?.used));
+check('opencode-go weekly share = 25%', ocWindows.find((w) => w.id === '7d')?.used === 0.25, String(ocWindows.find((w) => w.id === '7d')?.used));
+check('opencode-go monthly share = 63.5%', ocWindows.find((w) => w.id === 'monthTotal')?.used === 0.635, String(ocWindows.find((w) => w.id === 'monthTotal')?.used));
 
 // ---------------------------------------------------------------------------
 // B. Browser half
@@ -354,6 +466,22 @@ check('label renders an element', label !== null && typeof label === 'object' &&
 check('label carries its own glyph', label?.props?.children?.[0]?.tag === 'svg');
 check('label carries the nav text', label?.props?.children?.[1]?.props?.children?.length > 0, JSON.stringify(label?.props?.children?.[1]));
 check('component is a function', typeof entry.component === 'function');
+
+// Contract tripwire: the host labels a kept card `stale`, so the browser half has
+// to have a state for it, or a failed read would render as a healthy card.
+check(
+  'client renders the stale state the host emits',
+  source.includes('provider.stale === true') && source.includes('statusStale') && source.includes('staleHint'),
+  'client.js no longer handles provider.stale',
+);
+// Contract tripwire: OpenCode Go's three windows are three separate caps that
+// read the same percentage on a quiet account, so the share-collapse rule must
+// be scoped to the provider, or a fresh account would render one window of three.
+check(
+  'client keeps opencode-go windows separate at equal shares',
+  source.includes("dedupeWindows(provider.windows, provider.id)") && source.includes("id !== 'opencode-go'"),
+  'client.js no longer scopes the identical-share collapse to the provider',
+);
 
 delete globalThis.window;
 console.log(`\n${failures === 0 ? 'ALL CHECKS PASSED' : `${String(failures)} CHECK(S) FAILED`}`);

@@ -11,6 +11,15 @@
 The plugin registers one `settings.section` named 用量 (Usage), placed directly below
 **Agent 预设** (Agent presets), with its own hand-drawn bar-chart glyph.
 
+## Install the DSH desktop first
+
+The plugin lives inside Harness, so the desktop app comes first: download the
+**DeepSeek Harness desktop** from [deepseek.com/download](https://www.deepseek.com/download/),
+which serves the macOS build (Apple silicon, macOS 13 or later) and the Windows build;
+[deepseek.com/harness](https://www.deepseek.com/harness/) describes the product (the
+site labels it a preview). It runs in the background and reads local files — the usage
+figures this panel folds come out of the session logs it keeps on this machine.
+
 ## Install
 
 This is a standard DSH bundle (`package.json` declares `dsh.bundle.patch` and
@@ -42,11 +51,13 @@ HMR. To switch it off, override the row in the profile's own `cordis.patch.yml`:
 |---|---|
 | Today / All time | Total usage and cache hits, plus input / output / cache-write / billed-call detail |
 | History | A month calendar whose cells draw two proportional bars per day (total usage, cache hits); pick a day for its exact figures; step through months |
-| API quotas | `kimi-coding` (5-hour window, monthly total) and `commandcode` (5-hour, weekly, monthly) used share and reset times |
+| API quotas | `kimi-coding` (5-hour window, monthly total), `commandcode` (5-hour, weekly, monthly) and `opencode-go` (rolling 5-hour, weekly, monthly) used share and reset times |
 
 Token counts are always shown as **complete integers** — never abbreviated to `K` / `M` / `B`.
 
 `commandcode` is reported as a **percentage**, never as an amount: each of its models has its own dollar cap, so the same "US$48 left" buys a different amount of work per model and the figure is not comparable. The share of a window already spent is, so that is all the panel reports. The billing-period allowance is derived on the spot from **spent + remaining** (true for any plan), falling back to the published price table only when the API withholds the remaining figure; `kimi-coding` returns ratios itself and is unchanged.
+
+`opencode-go` reads `https://opencode.ai/zen/go/v1/usage`, which answers with each window's `percent` and `resetsAt` directly, so those are shown as they come. Its three windows are three separate caps (by the plan's own accounting: 5-hour = 20% of the monthly limit, weekly = 50%, monthly = 100%), so they stay three rows even on a quiet account where all three read 0% — equal percentages here are not a restatement of one limit. The credential reference is `OPENCODEGO_API_KEY`; the endpoint reports no plan (Go / Go Plus), so the card shows no plan row.
 
 ![API quotas](docs/panel-quota.png)
 
@@ -58,14 +69,15 @@ they are requested separately:
 | Half | Measured |
 |---|---|
 | Local fold (reading this machine's session logs) | tens of milliseconds |
-| Provider quota (one overseas round trip) | 2 to 8 seconds |
+| Provider quota (one overseas round trip) | usually 0.2-2 s, up to 10 s when the path jitters |
 
 Therefore:
 
 - the cards and the calendar paint as soon as the local data arrives, and the quota
   section fills in behind them;
-- all four provider requests go out **concurrently** (it used to be two serialized
-  groups — kimi, then command code — which paid the round trip twice);
+- all five provider requests go out **concurrently** (it used to be two serialized
+  groups — kimi, then command code — which paid the round trip twice; `opencode-go`
+  joined later and is concurrent as well);
 - a quota answer is served as-is while it is under 90 seconds old, and once stale it is
   returned immediately while a background refresh runs (`refreshing` tells the page to
   come back for the fresh answer);
@@ -73,6 +85,14 @@ Therefore:
   so **opening Settings is usually a cache hit**;
 - session logs are folded incrementally by `revision`: a log that merely grew costs one
   tail read instead of a full re-read.
+
+Network jitter never becomes a red card: each read gets its own **20-second** deadline and
+one **retry** when it times out or the socket drops (both requests are idempotent GETs),
+and when two rounds in a row fail, **the last good numbers stay** and are labelled with the
+time they came from plus why this round failed, instead of blanking the card. That is not
+theory — this machine's path to `api.commandcode.ai` is normally 230-900 ms, yet produced a
+10.5 s connect timeout and a 9.4 s response in a single afternoon, and the old 8-second
+deadline is exactly what turned the card into "the provider did not answer in time".
 
 ![Dark theme](docs/panel-dark.png)
 
@@ -116,9 +136,11 @@ node test/selfcheck.mjs      # or pnpm test
 It loads both halves the way the plugin systems do, activates them against stub
 contexts, and exercises all three routes offline: export forms, route shape and path
 uniqueness, the no-credential degraded response, the token accounting, the provider
-parsers, that the four requests really do overlap, that the local half touches no
-network, and the section's id / order / label / component type. Exit code 0 means all
-checks passed.
+parsers, that one timeout really does cost exactly one retry, that two failed rounds keep
+the previous good numbers and their failure reason, that a configuration change (a removed
+key) is never papered over with old numbers, that the five requests really do overlap, that
+the local half touches no network, and the section's id / order / label / component type.
+Exit code 0 means all checks passed.
 
 ## Credits
 

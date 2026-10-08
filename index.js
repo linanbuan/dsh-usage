@@ -38,8 +38,19 @@ export const name = 'dsh-usage'
  */
 export const inject = ['connection']
 
-/** Upstream deadline for one provider quota round. */
-const UPSTREAM_TIMEOUT_MS = 8_000
+/**
+ * Upstream deadline for one provider attempt.
+ *
+ * This machine's path to api.commandcode.ai is normally 230-900 ms, but it was
+ * measured at 10.5 s (a connect timeout) and 9.4 s in the same afternoon — both
+ * past the 8 s this used to allow, which is what turned the card into 读取失败.
+ * The panel is off the critical path (it paints from cache and revalidates
+ * behind the response), so a longer deadline costs the reader nothing.
+ */
+const UPSTREAM_TIMEOUT_MS = 20_000
+
+/** Attempts per provider read: a timeout or a dropped socket gets one retry. */
+const UPSTREAM_ATTEMPTS = 2
 
 /** How long a folded usage answer is reused before the session logs are re-read. */
 const USAGE_TTL_MS = 15_000
@@ -71,9 +82,20 @@ const KIMI_USAGE_URL = 'https://api.kimi.com/coding/v1/usages'
 /** Command Code public API origin. */
 const COMMANDCODE_BASE = 'https://api.commandcode.ai'
 
+/**
+ * OpenCode Go usage endpoint — the one its own web console reads.
+ *
+ * The plan meters every model in dollars against that model's own monthly
+ * limit, so the ratio the endpoint reports is account-wide; the three windows
+ * it returns (the rolling 5-hour one, the weekly one and the billing month)
+ * are the ones shown as 额度.
+ */
+const OPENCODE_GO_USAGE_URL = 'https://opencode.ai/zen/go/v1/usage'
+
 /** Credential references resolved from the harness credential store. */
 const KIMI_KEY_REF = 'KIMI_CODING_API_KEY'
 const COMMANDCODE_KEY_REF = 'COMMANDCODE_API_KEY'
+const OPENCODE_GO_KEY_REF = 'OPENCODEGO_API_KEY'
 
 /** Monthly credit allowance per Command Code plan id (public pricing table). */
 const COMMANDCODE_PLAN_TOTALS = {
@@ -660,11 +682,83 @@ function parseCommandCode(credits, subscription, summary) {
 }
 
 /**
+ * Parse the OpenCode Go `/zen/go/v1/usage` payload.
+ *
+ * The answer is `usage.{rolling,weekly,monthly}`, each a window with the share
+ * already spent (`percent`, 0-100) and an ISO `resetsAt`. The plan's own split
+ * is five-hour = 20% of the monthly limit, weekly = 50%, monthly = 100%, so the
+ * ids here line up with the cards beside it and the reported shares are used
+ * as they come.
+ *
+ * @param {any} body `/zen/go/v1/usage`
+ * @returns {{ windows: any[], plan: string|undefined }}
+ */
+function parseOpenCodeGo(body) {
+  const usage = body?.usage ?? {}
+  /** @param {string} key @param {string} id @param {string} label */
+  const window = (key, id, label) => {
+    const entry = usage[key]
+    if (entry === undefined || entry === null) return
+    const percent = finite(entry?.percent)
+    if (percent === undefined) return
+    // `status` is "ok" on a healthy window; a non-ok status means the window is
+    // at its limit, which is the state the commandcode card calls `exceeded`.
+    const status = typeof entry?.status === 'string' ? entry.status : 'ok'
+    return {
+      id,
+      label,
+      unit: 'percent',
+      used: share(percent, 100),
+      cap: 1,
+      resetAt: instant(entry?.resetsAt),
+      exceeded: status !== 'ok',
+    }
+  }
+  const windows = [
+    window('rolling', '5h', '五小时窗口'),
+    window('weekly', '7d', '每周窗口'),
+    window('monthly', 'monthTotal', '总额度（本计费周期）'),
+  ].filter((entry) => entry !== undefined)
+  return { windows, plan: undefined }
+}
+
+/**
+ * One provider read, retried once when the attempt timed out or the socket died.
+ *
+ * Each attempt gets its own deadline: sharing one signal would spend the second
+ * attempt on an already-expired signal. Every read here is a plain GET (or a
+ * body-less POST), so repeating one cannot double-count anything.
+ *
+ * @param {() => Promise<any>} read
+ * @returns {Promise<any>}
+ */
+async function readWithRetry(read) {
+  let result
+  for (let attempt = 1; attempt <= UPSTREAM_ATTEMPTS; attempt += 1) {
+    result = await read()
+    if (result === undefined || result.ok === true) break
+    if (result.code !== 'TIMEOUT' && result.code !== 'NETWORK') break
+  }
+  return result
+}
+
+/**
+ * One authenticated read with a fresh deadline per attempt.
+ *
+ * @param {string} url
+ * @param {string} key
+ * @returns {Promise<any>}
+ */
+function readJson(url, key) {
+  return readWithRetry(() => getJson(url, key, AbortSignal.timeout(UPSTREAM_TIMEOUT_MS)))
+}
+
+/**
  * Ask every provider, all in flight at once.
  *
  * The calls used to be two serialized groups (kimi, then command code's three),
  * which on this machine meant paying the provider round-trip latency twice —
- * measured at 8s cold for one panel open. One `Promise.all` over all four
+ * measured at 8s cold for one panel open. One `Promise.all` over all five
  * requests pays it once, and the three command-code reads of one account share
  * that single round trip.
  *
@@ -673,16 +767,17 @@ function parseCommandCode(credits, subscription, summary) {
  */
 async function fetchQuota(ctx) {
   const startedAt = Date.now()
-  const signal = AbortSignal.timeout(UPSTREAM_TIMEOUT_MS)
-  const [kimiKey, commandCodeKey] = await Promise.all([
+  const [kimiKey, commandCodeKey, openCodeGoKey] = await Promise.all([
     resolveKey(ctx, KIMI_KEY_REF),
     resolveKey(ctx, COMMANDCODE_KEY_REF),
+    resolveKey(ctx, OPENCODE_GO_KEY_REF),
   ])
-  const [kimiResult, credits, subscription, summary] = await Promise.all([
-    kimiKey === undefined ? undefined : getJson(KIMI_USAGE_URL, kimiKey, signal),
-    commandCodeKey === undefined ? undefined : getJson(`${COMMANDCODE_BASE}/alpha/billing/credits`, commandCodeKey, signal),
-    commandCodeKey === undefined ? undefined : getJson(`${COMMANDCODE_BASE}/alpha/billing/subscriptions`, commandCodeKey, signal),
-    commandCodeKey === undefined ? undefined : getJson(`${COMMANDCODE_BASE}/alpha/usage/summary`, commandCodeKey, signal),
+  const [kimiResult, credits, subscription, summary, openCodeGoResult] = await Promise.all([
+    kimiKey === undefined ? undefined : readJson(KIMI_USAGE_URL, kimiKey),
+    commandCodeKey === undefined ? undefined : readJson(`${COMMANDCODE_BASE}/alpha/billing/credits`, commandCodeKey),
+    commandCodeKey === undefined ? undefined : readJson(`${COMMANDCODE_BASE}/alpha/billing/subscriptions`, commandCodeKey),
+    commandCodeKey === undefined ? undefined : readJson(`${COMMANDCODE_BASE}/alpha/usage/summary`, commandCodeKey),
+    openCodeGoKey === undefined ? undefined : readJson(OPENCODE_GO_USAGE_URL, openCodeGoKey),
   ])
   const providers = []
 
@@ -761,6 +856,53 @@ async function fetchQuota(ctx) {
         fetchedAt: Date.now(),
       })
     }
+  }
+
+  if (openCodeGoResult === undefined) {
+    providers.push({
+      id: 'opencode-go',
+      name: 'opencode-go',
+      displayName: 'OpenCode Go',
+      status: 'no-key',
+      message: '未在凭据库中找到 OPENCODEGO_API_KEY。',
+      windows: [],
+      extras: [],
+    })
+  } else if (openCodeGoResult.ok) {
+    const parsed = parseOpenCodeGo(openCodeGoResult.body)
+    providers.push({
+      id: 'opencode-go',
+      name: 'opencode-go',
+      displayName: 'OpenCode Go',
+      status: 'ok',
+      windows: parsed.windows,
+      extras: [],
+      fetchedAt: Date.now(),
+    })
+  } else {
+    providers.push({
+      id: 'opencode-go',
+      name: 'opencode-go',
+      displayName: 'OpenCode Go',
+      status: 'error',
+      message: openCodeGoResult.message,
+      code: openCodeGoResult.code,
+      windows: [],
+      extras: [],
+    })
+  }
+
+  // A provider blip must not blank a card that already has numbers in it. When a
+  // read fails and the previous round had a good answer, the last good windows are
+  // kept and labelled `stale`, with this round's failure message alongside them,
+  // so the reader sees "slightly old numbers, and why" instead of an empty card.
+  // Configuration states (no key, wrong key) are deliberately not carried over.
+  const previous = quotaCache.value?.providers ?? []
+  for (const [index, provider] of providers.entries()) {
+    if (provider.status !== 'error') continue
+    const before = previous.find((entry) => entry.id === provider.id)
+    if (before === undefined || before.status !== 'ok') continue
+    providers[index] = { ...before, stale: true, message: provider.message, code: provider.code }
   }
 
   return { providers, fetchedAt: Date.now(), durationMs: Date.now() - startedAt }

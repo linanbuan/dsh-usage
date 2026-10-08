@@ -72,6 +72,8 @@ window.__ModuleLoader__.load({
         statusOk: '正常',
         statusError: '读取失败',
         statusNoKey: '未配置密钥',
+        statusStale: '上次成功的数据',
+        staleHint: '本次读取失败，以下数字来自',
         used: '已用',
         cap: '上限',
         reset: '刷新时间',
@@ -124,6 +126,8 @@ window.__ModuleLoader__.load({
         statusOk: 'OK',
         statusError: 'Failed',
         statusNoKey: 'No key',
+        statusStale: 'Last good read',
+        staleHint: 'This read failed; the figures below are from',
         used: 'Used',
         cap: 'Cap',
         reset: 'Resets',
@@ -814,10 +818,16 @@ window.__ModuleLoader__.load({
      * printed twice they read as two different limits, and the total is the one
      * worth keeping.
      *
+     * A provider whose windows are genuinely different money (OpenCode Go's
+     * 5-hour / weekly / monthly allowances are three separate caps) keeps all
+     * of them even at the same percentage: at 0% on a quiet account, the three
+     * windows are three separate limits, not one, and each has its own reset.
+     *
      * @param {any[]|undefined} windows
+     * @param {string|undefined} id the provider id, for the distinct-allowance case.
      * @returns {any[]}
      */
-    function dedupeWindows(windows) {
+    function dedupeWindows(windows, id) {
       const list = (Array.isArray(windows) ? windows : []).filter(
         (entry) => entry !== null && typeof entry === 'object',
       )
@@ -826,7 +836,7 @@ window.__ModuleLoader__.load({
       const kept = []
       for (const entry of list) {
         if (entry.id === 'monthCode' && totals.some((total) => total.used === entry.used)) continue
-        if (entry.unit === 'percent') {
+        if (entry.unit === 'percent' && id !== 'opencode-go') {
           const key = `p:${String(entry.used)}`
           if (seen.has(key)) continue
           seen.add(key)
@@ -834,6 +844,23 @@ window.__ModuleLoader__.load({
         kept.push(entry)
       }
       return kept
+    }
+
+    /**
+     * The status pill for one provider card.
+     *
+     * `ok` is the only state that reads as healthy. A card whose read just failed
+     * but whose numbers were kept from the last good round is labelled as such
+     * rather than as a failure, because the numbers above it are still true.
+     *
+     * @param {any} provider
+     * @returns {{ className: string, label: string }}
+     */
+    function providerPill(provider) {
+      if (provider.stale === true) return { className: 'dsu-pill dsu-pillMuted', label: tr('statusStale') }
+      if (provider.status === 'ok') return { className: 'dsu-pill dsu-pillOk', label: tr('statusOk') }
+      if (provider.status === 'no-key') return { className: 'dsu-pill', label: tr('statusNoKey') }
+      return { className: 'dsu-pill dsu-pillErr', label: tr('statusError') }
     }
 
     /**
@@ -845,6 +872,8 @@ window.__ModuleLoader__.load({
       useLocaleVersion()
       const provider = props.provider
       const ok = provider.status === 'ok'
+      const stale = provider.stale === true
+      const pill = providerPill(provider)
       return h(
         'div',
         { className: ok ? 'dsu-card' : 'dsu-card dsu-cardWarn' },
@@ -857,21 +886,10 @@ window.__ModuleLoader__.load({
             h('h3', { className: 'dsu-cardTitle' }, provider.displayName ?? provider.name),
             h('span', { className: 'dsu-hint' }, provider.name),
           ),
-          h(
-            'span',
-            {
-              className:
-                provider.status === 'ok'
-                  ? 'dsu-pill dsu-pillOk'
-                  : provider.status === 'no-key'
-                    ? 'dsu-pill'
-                    : 'dsu-pill dsu-pillErr',
-            },
-            provider.status === 'ok' ? tr('statusOk') : provider.status === 'no-key' ? tr('statusNoKey') : tr('statusError'),
-          ),
+          h('span', { className: pill.className }, pill.label),
         ),
         provider.planName === undefined ? null : h('span', { className: 'dsu-pill dsu-pillPlan' }, provider.planName),
-        ok ? null : h('p', { className: 'dsu-hint' }, provider.message ?? ''),
+        ok && !stale ? null : h('p', { className: 'dsu-hint' }, stale ? `${tr('staleHint')} ${stamp(provider.fetchedAt)}${provider.message === undefined ? '' : ` · ${provider.message}`}` : (provider.message ?? '')),
         (provider.windows ?? []).map((entry) =>
           h(QuotaWindow, { key: String(entry.id), window: entry, now: props.now }),
         ),
@@ -954,7 +972,7 @@ window.__ModuleLoader__.load({
                 providers.map((provider) =>
                   h(QuotaCard, {
                     key: String(provider.id),
-                    provider: { ...provider, windows: dedupeWindows(provider.windows) },
+                    provider: { ...provider, windows: dedupeWindows(provider.windows, provider.id) },
                     now: props.now,
                   }),
                 ),
