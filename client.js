@@ -1833,18 +1833,18 @@ window.__ModuleLoader__.load({
 .dsu-stripFoot{display:flex;flex-direction:column;gap:2px;border-top:1px solid var(--dsw-alias-border-l1,rgba(128,128,128,.18));padding-top:8px;font-size:11px;line-height:17px;color:var(--dsw-alias-label-secondary,currentColor);opacity:.85}
 /* ── activity heatmap ────────────────────────────────────────────────────── */
 .dsu-heatCard{gap:10px}
-.dsu-heatBody{display:flex;gap:6px;min-width:0}
-.dsu-heatRail{display:grid;grid-template-rows:repeat(7,14px);gap:3px;padding-top:16px;flex:none}
-.dsu-heatRailCell{width:12px;font-size:9px;line-height:14px;text-align:right;color:var(--dsw-alias-label-secondary,currentColor);opacity:.7}
+.dsu-heatBody{display:flex;align-items:stretch;gap:6px;min-width:0}
+.dsu-heatRail{display:grid;grid-template-rows:repeat(7,1fr);gap:3px;padding-top:16px;flex:none}
+.dsu-heatRailCell{display:flex;align-items:center;justify-content:flex-end;width:12px;font-size:9px;line-height:1;color:var(--dsw-alias-label-secondary,currentColor);opacity:.7}
 .dsu-heatPlot{position:relative;display:flex;flex-direction:column;gap:3px;flex:1 1 auto;min-width:0}
 .dsu-heatMonths{display:grid;gap:3px;height:13px}
 .dsu-heatMonth{font-size:10px;line-height:13px;white-space:nowrap;color:var(--dsw-alias-label-secondary,currentColor);opacity:.75}
-.dsu-heatGrid{display:grid;grid-template-rows:repeat(7,14px);gap:3px}
-.dsu-heatGridWeek{grid-template-rows:14px}
-.dsu-cell{box-sizing:border-box;width:100%;height:100%;padding:0;border:0;border-radius:3px;font:inherit;background:transparent;cursor:pointer}
+.dsu-heatGrid{display:grid;grid-template-rows:repeat(7,auto);align-content:start;gap:3px}
+.dsu-heatGridWeek{grid-template-rows:auto}
+.dsu-cell{box-sizing:border-box;width:100%;height:auto;aspect-ratio:1/1;align-self:start;padding:0;border:0;border-radius:3px;font:inherit;background:transparent;cursor:pointer}
 .dsu-cell:hover{filter:brightness(1.12)}
 .dsu-cell:focus-visible{outline:2px solid var(--dsw-alias-brand-primary,#3b6ef5);outline-offset:1px}
-.dsu-cellL0{background:var(--dsw-alias-bg-layer-1,rgba(128,128,128,.10))}
+.dsu-cellL0{background:transparent;box-shadow:inset 0 0 0 1px var(--dsw-alias-border-l1,rgba(128,128,128,.28))}
 /* The only hard-coded colours in this sheet: a heat scale has to be a scale, and
    the theme tokens carry one shade each. Three blues and three greens, from
    "barely there" to "saturated", both readable on light and dark cards. */
