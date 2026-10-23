@@ -5,3 +5,12 @@ node_modules/
 *.log
 .DS_Store
 Thumbs.db
+
+# CodeGraph's local index (rebuildable, machine-specific).
+.codegraph/
+.local/
+
+# Harness profile leftovers that show up when this repo is also the install
+# target (pnpm links, backups written by the plugin manager).
+*.bak-*
+pnpm-lock.yaml

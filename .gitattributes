@@ -1,0 +1,8 @@
+# Keep every text file LF in the object database, whichever machine checks the
+# repo out. The plugin is plain JS with no build step, so a CRLF checkout is
+# harmless at runtime but turns every diff into a whole-file rewrite.
+* text=auto eol=lf
+
+*.png binary
+*.jpg binary
+*.ico binary
