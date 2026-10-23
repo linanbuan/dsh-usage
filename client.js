@@ -458,7 +458,7 @@ window.__ModuleLoader__.load({
     // -----------------------------------------------------------------------
 
     /** Window width of the heatmap, in whole months. */
-    const WINDOW_MONTHS = 12
+    const WINDOW_MONTHS = 6
 
     /** @param {number} value @returns {string} at least two digits. */
     function pad2(value) {

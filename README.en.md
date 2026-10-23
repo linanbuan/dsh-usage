@@ -3,7 +3,7 @@
 [中文](README.md) | [English](README.en.md)
 
 > A **Usage** page inside the DeepSeek Harness (DSH) settings panel: token usage and
-> cache hits for today and all time, a twelve-month heatmap, and the quotas and reset
+> cache hits for today and all time, a six-month heatmap, and the quotas and reset
 > times of the APIs wired into this Harness.
 
 ![Usage panel](docs/panel-light.png)
@@ -50,7 +50,7 @@ HMR. To switch it off, override the row in the profile's own `cordis.patch.yml`:
 | Section | Content |
 |---|---|
 | Overview strip | Today's usage, today's cache hits, all-time usage and cache hits (with the cache share of the prompt), the busiest day, and the current and longest run of days |
-| History heatmap | Twelve months, one cell per day — or per week after switching to **Weekly**. Deeper colour means more usage; hover a cell (or focus it from the keyboard) to float that day's or week's usage and cache hits; click one for the full detail below, and step the window with the arrows |
+| History heatmap | Six months, one cell per day — or per week after switching to **Weekly**. Deeper colour means more usage; hover a cell (or focus it from the keyboard) to float that day's or week's usage and cache hits; click one for the full detail below, and step the window with the arrows |
 | API quotas | `kimi-coding` (5-hour window, monthly total), `commandcode` (5-hour, weekly, monthly) and `opencode-go` (rolling 5-hour, weekly, monthly) used share and reset times |
 
 Token counts are always shown as **complete integers** — never abbreviated to `K` / `M` / `B`.

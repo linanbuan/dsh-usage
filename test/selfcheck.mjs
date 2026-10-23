@@ -518,9 +518,9 @@ const {
   windowRange,
 } = internals;
 
-// The window is twelve whole months, ending with the anchor month's last day.
+// The window is six whole months (May–Oct 2026 for an October anchor), ending with the anchor month's last day.
 const range = windowRange({ year: 2026, month: 10 });
-check('window starts on the first day of the twelfth month back', range.startKey === '2025-11-01', range.startKey);
+check('window starts on the first day of the sixth month back', range.startKey === '2026-05-01', range.startKey);
 check('window ends on the last day of the anchor month', range.endKey === '2026-10-31', range.endKey);
 
 const dayCols = dayColumns(range.startKey, range.endKey);
@@ -528,13 +528,13 @@ const inWindow = dayCols.flat().filter((cell) => cell.inRange);
 check('day columns are whole weeks of seven cells', dayCols.every((week) => week.length === 7), String(dayCols.length));
 check('day columns start on a Monday', dayCols[0][0].date.getDay() === 1, dayCols[0][0].key);
 check('day columns end on a Sunday', dayCols[dayCols.length - 1][6].date.getDay() === 0, dayCols[dayCols.length - 1][6].key);
-check('every day of the window appears exactly once', inWindow.length === 365, String(inWindow.length));
-check('the grid pads the days before the window instead of shifting it', dayCols[0][0].inRange === false && inWindow[0].key === '2025-11-01', inWindow[0].key);
+check('every day of the window appears exactly once', inWindow.length === 184, String(inWindow.length));
+check('the grid pads the days before the window instead of shifting it', dayCols[0][0].inRange === false && inWindow[0].key === '2026-05-01', inWindow[0].key);
 
 const weekCols = weekColumns(range.startKey, range.endKey);
 check('week columns are keyed by their Monday', weekCols.every((week) => week.startKey === week.key), weekCols[0].key);
-check('week columns start at the Monday of the window start', weekCols[0].startKey === '2025-10-27', weekCols[0].startKey);
-check('the clipped first week keeps only its in-window days', weekCols[0].days.length === 2, String(weekCols[0].days.length));
+check('week columns start at the Monday of the window start', weekCols[0].startKey === '2026-04-27', weekCols[0].startKey);
+check('the clipped first week keeps only its in-window days', weekCols[0].days.length === 3, String(weekCols[0].days.length));
 check(
   'weekly and daily modes cover the same days',
   weekCols.reduce((sum, week) => sum + week.days.length, 0) === inWindow.length,
@@ -586,9 +586,9 @@ check('a run that ended yesterday still counts as current', yesterday.current ==
 check('addDays crosses a month boundary on calendar parts', dateKey(addDays(new Date(2026, 9, 31), 1)) === '2026-11-01', dateKey(addDays(new Date(2026, 9, 31), 1)));
 
 const ticks = monthTicks(dayCols);
-check('month ticks label all twelve months', ticks.length === 12, String(ticks.length));
+check('month ticks label all six months', ticks.length === 6, String(ticks.length));
 check('month ticks are in column order', ticks.every((tick, index) => index === 0 || tick.column > ticks[index - 1].column), JSON.stringify(ticks));
-check('the first tick is the window start month', ticks[0].label === '11月', ticks[0].label);
+check('the first tick is the window start month', ticks[0].label === '5月', ticks[0].label);
 
 /** Depth-first walk over the stub renderer's element tree. */
 const walk = (node, visit) => {

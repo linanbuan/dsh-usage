@@ -14,3 +14,6 @@ Thumbs.db
 # target (pnpm links, backups written by the plugin manager).
 *.bak-*
 pnpm-lock.yaml
+
+# 只在本机，不进公开仓库
+AI推送须知.md
