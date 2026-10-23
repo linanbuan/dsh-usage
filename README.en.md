@@ -3,7 +3,7 @@
 [中文](README.md) | [English](README.en.md)
 
 > A **Usage** page inside the DeepSeek Harness (DSH) settings panel: token usage and
-> cache hits for today and all time, a history calendar, and the quotas and reset
+> cache hits for today and all time, a twelve-month heatmap, and the quotas and reset
 > times of the APIs wired into this Harness.
 
 ![Usage panel](docs/panel-light.png)
@@ -49,8 +49,8 @@ HMR. To switch it off, override the row in the profile's own `cordis.patch.yml`:
 
 | Section | Content |
 |---|---|
-| Today / All time | Total usage and cache hits, plus input / output / cache-write / billed-call detail |
-| History | A month calendar whose cells draw two proportional bars per day (total usage, cache hits); pick a day for its exact figures; step through months |
+| Overview strip | Today's usage, today's cache hits, all-time usage and cache hits (with the cache share of the prompt), the busiest day, and the current and longest run of days |
+| History heatmap | Twelve months, one cell per day — or per week after switching to **Weekly**. Deeper colour means more usage; hover a cell (or focus it from the keyboard) to float that day's or week's usage and cache hits; click one for the full detail below, and step the window with the arrows |
 | API quotas | `kimi-coding` (5-hour window, monthly total), `commandcode` (5-hour, weekly, monthly) and `opencode-go` (rolling 5-hour, weekly, monthly) used share and reset times |
 
 Token counts are always shown as **complete integers** — never abbreviated to `K` / `M` / `B`.
@@ -73,7 +73,7 @@ they are requested separately:
 
 Therefore:
 
-- the cards and the calendar paint as soon as the local data arrives, and the quota
+- the strip and the heatmap paint as soon as the local data arrives, and the quota
   section fills in behind them;
 - all five provider requests go out **concurrently** (it used to be two serialized
   groups — kimi, then command code — which paid the round trip twice; `opencode-go`
@@ -102,7 +102,7 @@ deadline is exactly what turned the card into "the provider did not answer in ti
   `@deepseek-ai/dsh-token-meter`: a billed record's `inputTokens` is its **uncached**
   prompt, so cache hits are never double counted.
 - Cache hits are that accounting's cache-read share.
-- Days are bucketed by **local timezone** calendar day.
+- Days are bucketed by **local timezone** calendar day; **weekly** folds them into ISO weeks (Monday to Sunday).
 - Data comes from the Host's `sessionPersistence` service — the compressed on-disk
   session format is never re-implemented here.
 
@@ -115,8 +115,9 @@ index.js           host half: /api/usage/usage, /api/usage/quota, /api/usage/rep
 client.js          browser half: the settings.section page (build-free lazy CJS bundle)
 icon.svg           bundle icon
 locale/*.json      plugin-manager title and description
-docs/              screenshots taken from the running UI
+docs/              panel shots produced by test/preview.mjs
 test/selfcheck.mjs activation self-check
+test/preview.mjs   static preview: renders the real component tree to HTML
 ```
 
 ## Privacy
@@ -140,7 +141,19 @@ parsers, that one timeout really does cost exactly one retry, that two failed ro
 the previous good numbers and their failure reason, that a configuration change (a removed
 key) is never papered over with old numbers, that the five requests really do overlap, that
 the local half touches no network, and the section's id / order / label / component type.
-Exit code 0 means all checks passed.
+The browser half additionally asserts the heatmap's window, week columns, ISO weeks, shades,
+weekly aggregation and day runs, plus the rendered grid's cell count, `aria-label`s, legend
+and toggles. Exit code 0 means all checks passed.
+
+To look at the panel without starting Harness:
+
+```bash
+node test/preview.mjs        # writes .local/preview/{light,dark}.html
+```
+
+It renders the same CSS and the same real component tree into a static page; only the theme
+variables are supplied by the page. The shots in `docs/` come from it (the hover tooltip in
+them is a sample laid out with the same classes).
 
 ## Credits
 

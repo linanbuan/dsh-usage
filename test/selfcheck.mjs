@@ -483,6 +483,194 @@ check(
   'client.js no longer scopes the identical-share collapse to the provider',
 );
 
+// ---------------------------------------------------------------------------
+// C. Activity heatmap — the parts that fail silently
+//
+// A heatmap stuck in one shade still renders, and a week fold that sums the
+// wrong seven days still prints eight-digit numbers. These assert the scale, the
+// folds and one rendered tree, because the visual check cannot be automated here.
+// ---------------------------------------------------------------------------
+console.log('\nC. activity heatmap');
+
+const internals = clientModule.__internals;
+check(
+  '__internals exposes the pure helpers (test seam only)',
+  internals !== undefined && typeof internals.thresholdsOf === 'function',
+  typeof internals,
+);
+
+const {
+  Activity,
+  SelectionDetail,
+  StatStrip,
+  addDays,
+  aggregateBuckets,
+  dateKey,
+  dayColumns,
+  isoWeek,
+  levelOf,
+  metricOf,
+  monthTicks,
+  streaks,
+  thresholdsOf,
+  weekColumns,
+  weekKeyOf,
+  windowRange,
+} = internals;
+
+// The window is twelve whole months, ending with the anchor month's last day.
+const range = windowRange({ year: 2026, month: 10 });
+check('window starts on the first day of the twelfth month back', range.startKey === '2025-11-01', range.startKey);
+check('window ends on the last day of the anchor month', range.endKey === '2026-10-31', range.endKey);
+
+const dayCols = dayColumns(range.startKey, range.endKey);
+const inWindow = dayCols.flat().filter((cell) => cell.inRange);
+check('day columns are whole weeks of seven cells', dayCols.every((week) => week.length === 7), String(dayCols.length));
+check('day columns start on a Monday', dayCols[0][0].date.getDay() === 1, dayCols[0][0].key);
+check('day columns end on a Sunday', dayCols[dayCols.length - 1][6].date.getDay() === 0, dayCols[dayCols.length - 1][6].key);
+check('every day of the window appears exactly once', inWindow.length === 365, String(inWindow.length));
+check('the grid pads the days before the window instead of shifting it', dayCols[0][0].inRange === false && inWindow[0].key === '2025-11-01', inWindow[0].key);
+
+const weekCols = weekColumns(range.startKey, range.endKey);
+check('week columns are keyed by their Monday', weekCols.every((week) => week.startKey === week.key), weekCols[0].key);
+check('week columns start at the Monday of the window start', weekCols[0].startKey === '2025-10-27', weekCols[0].startKey);
+check('the clipped first week keeps only its in-window days', weekCols[0].days.length === 2, String(weekCols[0].days.length));
+check(
+  'weekly and daily modes cover the same days',
+  weekCols.reduce((sum, week) => sum + week.days.length, 0) === inWindow.length,
+  `${String(weekCols.reduce((sum, week) => sum + week.days.length, 0))} vs ${String(inWindow.length)}`,
+);
+check('weekKeyOf folds a Friday onto its Monday', weekKeyOf('2026-10-23') === '2026-10-19', weekKeyOf('2026-10-23'));
+check('weekKeyOf leaves a Monday where it is', weekKeyOf('2026-10-19') === '2026-10-19', weekKeyOf('2026-10-19'));
+check('isoWeek: 2026-01-01 is week 1', isoWeek(new Date(2026, 0, 1)) === 1, String(isoWeek(new Date(2026, 0, 1))));
+check('isoWeek: 2025-12-29 belongs to week 1 of 2026', isoWeek(new Date(2025, 11, 29)) === 1, String(isoWeek(new Date(2025, 11, 29))));
+check('isoWeek: 2026-10-23 is week 43', isoWeek(new Date(2026, 9, 23)) === 43, String(isoWeek(new Date(2026, 9, 23))));
+
+const thresholds = thresholdsOf([0, 10, 20, 30, 40, 50, 60, 70, 80, 90, 100]);
+check(
+  'three ascending cut-offs for four shades',
+  thresholds.length === 3 && thresholds[0] < thresholds[1] && thresholds[1] < thresholds[2],
+  JSON.stringify(thresholds),
+);
+check('a day with nothing recorded is unshaded', levelOf(0, thresholds) === 0, String(levelOf(0, thresholds)));
+check('the lightest shade starts above zero', levelOf(1, thresholds) === 1, String(levelOf(1, thresholds)));
+check('the darkest shade is reachable', levelOf(10_000, thresholds) === 4, String(levelOf(10_000, thresholds)));
+check(
+  'the scale never runs backwards',
+  [1, thresholds[0], thresholds[1], thresholds[2], 10_000]
+    .map((value) => levelOf(value, thresholds))
+    .every((level, index, all) => index === 0 || level >= all[index - 1]),
+);
+const flat = thresholdsOf([5, 5, 5, 5]);
+check('a window where every day is equal collapses to one shade', flat.length === 1 && levelOf(5, flat) === 1, JSON.stringify(flat));
+check('metricOf shades by total or by cache hits', metricOf({ total: 100, cacheRead: 70 }, 'total') === 100 && metricOf({ total: 100, cacheRead: 70 }, 'cache') === 70);
+check('a day with no bucket shades as empty', metricOf(undefined, 'total') === 0 && metricOf(undefined, 'cache') === 0);
+
+const folded = aggregateBuckets(
+  [
+    { date: '2026-10-19', input: 1, output: 2, cacheRead: 3, cacheWrite: 4, total: 10, requests: 1, providers: { kimi: { input: 1, output: 2, cacheRead: 3, cacheWrite: 4, total: 10, requests: 1 } } },
+    { date: '2026-10-20', input: 5, output: 6, cacheRead: 7, cacheWrite: 8, total: 26, requests: 2, providers: { kimi: { input: 5, output: 6, cacheRead: 7, cacheWrite: 8, total: 26, requests: 2 } } },
+  ],
+  '2026-10-19',
+);
+check('a week sums every field', folded?.total === 36 && folded?.cacheRead === 10 && folded?.requests === 3, JSON.stringify(folded)?.slice(0, 160));
+check('a week keeps the provider split', folded?.providers?.kimi?.total === 36 && folded?.providers?.kimi?.requests === 3, JSON.stringify(folded?.providers)?.slice(0, 160));
+check('a week with no records at all is undefined', aggregateBuckets([undefined, undefined], '2026-10-19') === undefined);
+
+const streak = streaks(['2026-10-20', '2026-10-21', '2026-10-22', '2026-10-23'], '2026-10-23');
+check('a run ending today is the current streak', streak.current === 4 && streak.longest === 4, JSON.stringify(streak));
+const gapped = streaks(['2026-10-19', '2026-10-20', '2026-10-22'], '2026-10-22');
+check('a gap ends the run', gapped.current === 1 && gapped.longest === 2, JSON.stringify(gapped));
+const yesterday = streaks(['2026-10-22'], '2026-10-23');
+check('a run that ended yesterday still counts as current', yesterday.current === 1, JSON.stringify(yesterday));
+check('addDays crosses a month boundary on calendar parts', dateKey(addDays(new Date(2026, 9, 31), 1)) === '2026-11-01', dateKey(addDays(new Date(2026, 9, 31), 1)));
+
+const ticks = monthTicks(dayCols);
+check('month ticks label all twelve months', ticks.length === 12, String(ticks.length));
+check('month ticks are in column order', ticks.every((tick, index) => index === 0 || tick.column > ticks[index - 1].column), JSON.stringify(ticks));
+check('the first tick is the window start month', ticks[0].label === '11月', ticks[0].label);
+
+/** Depth-first walk over the stub renderer's element tree. */
+const walk = (node, visit) => {
+  if (node === null || node === undefined || typeof node !== 'object') return;
+  if (Array.isArray(node)) {
+    for (const child of node) walk(child, visit);
+    return;
+  }
+  visit(node);
+  walk(node.props?.children, visit);
+};
+
+const today = dateKey(new Date());
+const withData = [{ date: today, input: 1, output: 2, cacheRead: 3, cacheWrite: 0, total: 6, requests: 4, providers: {} }];
+const liveRange = windowRange({ year: new Date().getFullYear(), month: new Date().getMonth() + 1 });
+const expectedDays = dayColumns(liveRange.startKey, liveRange.endKey).flat().filter((cell) => cell.inRange).length;
+
+const dayTree = Activity({ days: withData, grain: 'day', onGrain: () => {}, selected: { grain: 'day', key: today }, onSelect: () => {} });
+const cells = [];
+const tabs = [];
+const swatches = [];
+walk(dayTree, (node) => {
+  const className = node.props?.className;
+  if (typeof className === 'string' && className.includes('dsu-cell')) cells.push(node);
+  if (node.props?.role === 'tab') tabs.push(node);
+  if (typeof className === 'string' && className.includes('dsu-swatch')) swatches.push(node);
+});
+check('the daily grid renders one cell per day in the window', cells.length === expectedDays, `${String(cells.length)} vs ${String(expectedDays)}`);
+const selectedCell = cells.find((node) => node.props.className.includes('dsu-cellSelected'));
+check('the selected day is drawn as selected', selectedCell !== undefined);
+check(
+  'a cell names both figures for screen readers',
+  selectedCell?.props['aria-label']?.includes('总用量 6') && selectedCell?.props['aria-label']?.includes('缓存命中 3'),
+  selectedCell?.props['aria-label'],
+);
+check('a day with data takes a shade', selectedCell?.props.className.includes('dsu-cellL1'), selectedCell?.props.className);
+const emptyCell = cells.find((node) => node.props.className.includes('dsu-cellL0') && !node.props.className.includes('dsu-cellToday'));
+check('a day with no records says so', emptyCell?.props['aria-label']?.includes('没有记录'), emptyCell?.props['aria-label']);
+check('both toggles are present (grain and metric)', tabs.length === 4, String(tabs.length));
+check('the legend shows five steps', swatches.length === 5, String(swatches.length));
+check('the legend follows the active metric', swatches[1].props.className.includes('dsu-swatchTotal'), swatches[1].props.className);
+
+const weekTree = Activity({ days: withData, grain: 'week', onGrain: () => {}, selected: { grain: 'week', key: weekKeyOf(today) }, onSelect: () => {} });
+const weekCells = [];
+walk(weekTree, (node) => {
+  if (typeof node.props?.className === 'string' && node.props.className.includes('dsu-cell')) weekCells.push(node);
+});
+const expectedWeeks = weekColumns(liveRange.startKey, liveRange.endKey).length;
+check('the weekly grid renders one cell per week in the window', weekCells.length === expectedWeeks, `${String(weekCells.length)} vs ${String(expectedWeeks)}`);
+
+const weekDetail = SelectionDetail({ grain: 'week', point: '2026-10-19', bucket: folded });
+const weekText = [];
+walk(weekDetail, (node) => {
+  if (typeof node.props?.children === 'string') weekText.push(node.props.children);
+  if (typeof node.props?.children === 'number') weekText.push(String(node.props.children));
+});
+const weekBlob = weekText.join(' | ');
+check('the week detail names the span and the ISO week', weekBlob.includes('选中周') && weekBlob.includes('第 43 周'), weekBlob.slice(0, 160));
+check('the week detail prints the summed usage', weekBlob.includes('36'), weekBlob.slice(0, 160));
+
+// The strip carries today, the window totals, the busiest day and the run of days.
+const stripTree = StatStrip({
+  today: { date: today, input: 1, output: 2, cacheRead: 3, cacheWrite: 0, total: 6, requests: 4, providers: {} },
+  totals: { input: 10, output: 20, cacheRead: 30, cacheWrite: 0, total: 60, requests: 40 },
+  days: [
+    { date: dateKey(addDays(new Date(), -1)), input: 0, output: 0, cacheRead: 100, cacheWrite: 0, total: 100, requests: 1, providers: {} },
+    { date: today, input: 1, output: 2, cacheRead: 3, cacheWrite: 0, total: 6, requests: 4, providers: {} },
+  ],
+});
+const stripText = [];
+const stripStats = [];
+walk(stripTree, (node) => {
+  if (typeof node.props?.className === 'string' && node.props.className.split(' ').includes('dsu-stat')) stripStats.push(node);
+  if (typeof node.props?.children === 'string') stripText.push(node.props.children);
+});
+const stripBlob = stripText.join(' | ');
+check('the strip shows six figures', stripStats.length === 6, String(stripStats.length));
+check('the strip names today and the window totals', stripBlob.includes('6') && stripBlob.includes('60'), stripBlob.slice(0, 200));
+check('the strip reports the busiest day', stripBlob.includes('100'), stripBlob.slice(0, 200));
+check('the strip counts the run of days', stripBlob.includes('2 天'), stripBlob.slice(0, 200));
+check('no figure falls back to NaN or undefined', !stripBlob.includes('NaN') && !stripBlob.includes('undefined'), stripBlob.slice(0, 200));
+
 delete globalThis.window;
 console.log(`\n${failures === 0 ? 'ALL CHECKS PASSED' : `${String(failures)} CHECK(S) FAILED`}`);
 process.exitCode = failures === 0 ? 0 : 1;
