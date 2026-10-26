@@ -5,7 +5,7 @@
  * channel, all answered as HTTP 200 with an `ok` discriminator so a provider
  * failure can never be mistaken for the channel's own session authentication:
  *
- *   GET /api/usage/usage    — token usage folds alone (local, milliseconds).
+ *   GET /api/usage/usage    — token usage from the local ledger (local, milliseconds).
  *   GET /api/usage/quota    — provider quota snapshot alone (remote, seconds).
  *   GET /api/usage/report   — both, for a single-call consumer.
  *
@@ -25,8 +25,24 @@
  * `inputTokens` is its UNCACHED prompt, so the total is
  * `input + cacheRead + cacheWrite + output`.
  *
+ * The cumulative figures come from `lib/ledger.js`, not from a fold of whatever
+ * session logs happen to exist: the ledger remembers each session's contribution
+ * and its log position, so a session that is deleted stops being read but never
+ * stops being counted. A log that merely grew costs one tail read.
+ *
  * @module @local/dsh-usage
  */
+
+import {
+  emptyBucket,
+  emptyLedger,
+  ledgerView,
+  loadLedgerFile,
+  localDateKey,
+  resolveLedgerPath,
+  saveLedgerMerged,
+  syncLedger,
+} from './lib/ledger.js'
 
 /** Cordis plugin name. */
 export const name = 'dsh-usage'
@@ -52,7 +68,7 @@ const UPSTREAM_TIMEOUT_MS = 20_000
 /** Attempts per provider read: a timeout or a dropped socket gets one retry. */
 const UPSTREAM_ATTEMPTS = 2
 
-/** How long a folded usage answer is reused before the session logs are re-read. */
+/** How long a usage answer is reused before the ledger is advanced again. */
 const USAGE_TTL_MS = 15_000
 
 /**
@@ -70,11 +86,18 @@ const QUOTA_BACKGROUND_MS = 5 * 60_000
 /** Delay before the activation warm-up runs, so it never competes with boot. */
 const WARMUP_DELAY_MS = 2_500
 
-/** Session-log events read per page while folding one session. */
-const READ_PAGE = 512
+/**
+ * How often the ledger is advanced in the background.
+ *
+ * The sync only reads sessions whose change token moved, so ten minutes of
+ * idling costs one directory listing (tens of milliseconds). Ten minutes is the
+ * cadence the operator asked for: fine-grained enough that "today" is never far
+ * behind, rare enough to be invisible.
+ */
+const LEDGER_SYNC_MS = 10 * 60_000
 
-/** Hard stop on one session's fold, so a pathological log cannot stall a request. */
-const MAX_EVENTS_PER_SESSION = 400_000
+/** Floor for a configured cadence, so a typo cannot turn into a log storm. */
+const LEDGER_SYNC_MIN_MS = 60_000
 
 /** Kimi for Coding (managed) usage endpoint — the one its own CLI reads. */
 const KIMI_USAGE_URL = 'https://api.kimi.com/coding/v1/usages'
@@ -122,7 +145,7 @@ const COMMANDCODE_PLAN_LABELS = {
 }
 
 // ---------------------------------------------------------------------------
-// Usage folding
+// Usage as the panel sees it
 // ---------------------------------------------------------------------------
 
 /**
@@ -140,257 +163,154 @@ const COMMANDCODE_PLAN_LABELS = {
  */
 
 /**
- * One session's fold, plus the log position it has consumed.
+ * The ledger, its path and its last sync, kept for the lifetime of the process.
  *
- * `offset` is what makes the fold incremental: events are contiguous from seq 0
- * and are never rewritten, so a log that changed can be advanced from where the
- * last fold stopped instead of being re-read in full. The revision is an opaque
- * per-process change token, so an equal revision means "nothing to do".
+ * The document itself is the durable state: everything the panel shows is a
+ * merge of it, so restarting the Host never changes a number it has already
+ * reported.
  *
- * @typedef {object} SessionFold
- * @property {unknown} revision
- * @property {number} offset next unread seq
- * @property {Map<string, DayBucket>} days
+ * @type {{
+ *   path: string|undefined,
+ *   ledger: any,
+ *   warnings: string[],
+ *   syncedAt: number,
+ *   inFlight: Promise<any>|undefined,
+ *   last: { sessions: number, read: number, skipped: number, gone: number, tookMs: number, warnings: string[] }|undefined,
+ *   view: { at: number, value: any|undefined },
+ * }}
  */
-
-/**
- * Session-id keyed fold cache.
- *
- * @type {Map<string, SessionFold>}
- */
-const folds = new Map()
-
-/** Last folded usage report and the instant it was produced. */
-let usageCache = { at: 0, value: undefined }
+const ledgerRuntime = {
+  path: undefined,
+  ledger: undefined,
+  warnings: [],
+  syncedAt: 0,
+  inFlight: undefined,
+  last: undefined,
+  view: { at: -1, value: undefined },
+}
 
 /** Last provider quota snapshot, the instant it was produced, and its in-flight revalidation. */
 let quotaCache = { at: 0, value: undefined, inFlight: undefined }
 
 /**
- * @param {unknown} value
- * @returns {number} a finite non-negative integer, or 0.
- */
-function count(value) {
-  return typeof value === 'number' && Number.isFinite(value) && value > 0 ? Math.round(value) : 0
-}
-
-/**
- * The local calendar date of an instant, as `YYYY-MM-DD`.
+ * Advance the ledger by one sync, joining a run already in flight.
  *
- * Usage is bucketed in the operator's own timezone, which is what a calendar
- * view of "今天" has to mean.
- *
- * @param {number} epochMs
- * @returns {string}
- */
-function localDateKey(epochMs) {
-  const at = new Date(typeof epochMs === 'number' && Number.isFinite(epochMs) ? epochMs : Date.now())
-  const month = String(at.getMonth() + 1).padStart(2, '0')
-  const day = String(at.getDate()).padStart(2, '0')
-  return `${String(at.getFullYear())}-${month}-${day}`
-}
-
-/**
- * @param {string} date
- * @returns {DayBucket}
- */
-function emptyBucket(date) {
-  return {
-    date,
-    input: 0,
-    output: 0,
-    cacheRead: 0,
-    cacheWrite: 0,
-    total: 0,
-    requests: 0,
-    providers: {},
-  }
-}
-
-/**
- * Add one billed attempt into a bucket, in place.
- *
- * @param {DayBucket} bucket
- * @param {import('@deepseek-ai/dsh-session').TokenUsage} usage
- * @param {string} provider
- */
-function addUsage(bucket, usage, provider) {
-  const input = count(usage.inputTokens)
-  const output = count(usage.outputTokens)
-  const cacheRead = count(usage.cacheReadTokens)
-  const cacheWrite = count(usage.cacheWriteTokens)
-  const total = input + cacheRead + cacheWrite + output
-  bucket.input += input
-  bucket.output += output
-  bucket.cacheRead += cacheRead
-  bucket.cacheWrite += cacheWrite
-  bucket.total += total
-  bucket.requests += 1
-  const key = provider === '' ? 'unknown' : provider
-  const child = bucket.providers[key] ?? emptyBucket(bucket.date)
-  child.input += input
-  child.output += output
-  child.cacheRead += cacheRead
-  child.cacheWrite += cacheWrite
-  child.total += total
-  child.requests += 1
-  bucket.providers[key] = child
-}
-
-/**
- * Advance one stored session's fold.
- *
- * When `previous` is given the read resumes at the seq that fold stopped on and
- * merges into its day map, so a log that merely grew costs one tail read instead
- * of a full re-read. `snapshot.eventCount`, when the backend reports it, is the
- * cheap guard against resuming past a log whose length went down (which the
- * append-only contract says cannot happen, but a truncated physical tail could
- * look like).
+ * Every caller — the background timer, the activation warm-up and a panel
+ * request — shares one promise, so a burst of reads can never fold the logs
+ * twice or write the file twice at the same moment.
  *
  * @param {any} persistence the sessionPersistence service.
- * @param {string} id stored session id.
- * @param {SessionFold|undefined} previous the fold to advance, when resuming.
- * @param {number|undefined} eventCount the snapshot's own event count, when known.
- * @returns {Promise<SessionFold>}
+ * @returns {Promise<any>} the ledger document after the sync.
  */
-async function foldSession(persistence, id, previous, eventCount) {
-  const stale = typeof eventCount === 'number' && previous !== undefined && eventCount < previous.offset
-  const resume = previous !== undefined && previous.offset > 0 && !stale
-  const days = resume ? previous.days : new Map()
-  let offset = resume ? previous.offset : 0
-  const handle = await persistence.open(id, 'read')
-  try {
-    while (offset < MAX_EVENTS_PER_SESSION) {
-      const page = await handle.read(offset, READ_PAGE)
-      const events = Array.isArray(page?.events) ? page.events : []
-      if (events.length === 0) break
-      for (const event of events) {
-        if (event?.type !== 'assistant/message') continue
-        const usage = event?.data?.usage
-        if (usage === undefined || usage === null) continue
-        const date = localDateKey(event.time)
-        const bucket = days.get(date) ?? emptyBucket(date)
-        addUsage(bucket, usage, String(event?.data?.message?.source?.provider ?? ''))
-        days.set(date, bucket)
-      }
-      const last = events[events.length - 1]
-      const next = typeof last?.seq === 'number' ? last.seq + 1 : offset + events.length
-      if (next <= offset) break
-      // Advance first, then stop: the recorded offset is always the next unread
-      // seq, which is what a later incremental read resumes from.
-      offset = next
-      if (events.length < READ_PAGE) break
+function ensureLedgerSynced(persistence) {
+  if (ledgerRuntime.inFlight !== undefined) return ledgerRuntime.inFlight
+  const run = (async () => {
+    if (ledgerRuntime.path === undefined) ledgerRuntime.path = resolveLedgerPath()
+    if (ledgerRuntime.ledger === undefined) {
+      const loaded = loadLedgerFile(ledgerRuntime.path)
+      ledgerRuntime.ledger = loaded.ledger
+      ledgerRuntime.warnings = loaded.warnings.slice()
     }
-  } finally {
-    await handle.close()
-  }
-  return { revision: undefined, offset, days }
+    const ledger = ledgerRuntime.ledger
+    const result = await syncLedger(persistence, ledger)
+    ledgerRuntime.last = result
+    ledgerRuntime.warnings = ledgerRuntime.warnings.concat(result.warnings).slice(-20)
+    // Merge with whatever another Host process wrote rather than overwriting it:
+    // two windows sharing one home must never rewind each other's position.
+    ledgerRuntime.ledger = saveLedgerMerged(ledgerRuntime.path, ledger)
+    ledgerRuntime.syncedAt = Date.now()
+    return ledgerRuntime.ledger
+  })().finally(() => {
+    if (ledgerRuntime.inFlight === run) ledgerRuntime.inFlight = undefined
+  })
+  ledgerRuntime.inFlight = run
+  return run
 }
 
 /**
- * Merge one fold's days into the running totals.
+ * The usage payload for a Host with no session persistence to read.
  *
- * @param {Map<string, DayBucket>} into
- * @param {Map<string, DayBucket>} from
+ * @param {string} [reason]
+ * @returns {any}
  */
-function mergeDays(into, from) {
-  for (const [date, bucket] of from) {
-    const target = into.get(date) ?? emptyBucket(date)
-    target.input += bucket.input
-    target.output += bucket.output
-    target.cacheRead += bucket.cacheRead
-    target.cacheWrite += bucket.cacheWrite
-    target.total += bucket.total
-    target.requests += bucket.requests
-    for (const [provider, child] of Object.entries(bucket.providers)) {
-      const existing = target.providers[provider] ?? emptyBucket(date)
-      existing.input += child.input
-      existing.output += child.output
-      existing.cacheRead += child.cacheRead
-      existing.cacheWrite += child.cacheWrite
-      existing.total += child.total
-      existing.requests += child.requests
-      target.providers[provider] = existing
-    }
-    into.set(date, target)
-  }
-}
-
-/**
- * Fold every stored session visible to this Host into per-day buckets.
- *
- * Only sessions whose change token moved are touched, and those are advanced
- * from where their previous fold stopped rather than re-read.
- *
- * @param {any} persistence
- * @returns {Promise<{ days: DayBucket[], today: DayBucket, totals: DayBucket, scan: object }>}
- */
-async function collectUsage(persistence) {
-  const startedAt = Date.now()
-  const warnings = []
-  let snapshots = []
-  try {
-    snapshots = await persistence.list()
-  } catch (error) {
-    warnings.push(`list failed: ${String(error?.message ?? error)}`)
-  }
-  const live = new Set()
-  let rescanned = 0
-  for (const snapshot of snapshots) {
-    const id = String(snapshot?.header?.id ?? '')
-    if (id === '') continue
-    live.add(id)
-    const cached = folds.get(id)
-    if (cached !== undefined && cached.revision === snapshot.revision) continue
-    rescanned += 1
-    try {
-      const advanced = await foldSession(persistence, id, cached, snapshot.eventCount)
-      folds.set(id, { ...advanced, revision: snapshot.revision })
-    } catch (error) {
-      warnings.push(`${id}: ${String(error?.message ?? error)}`)
-      // Keep whatever was folded before rather than dropping the session.
-      if (cached === undefined) folds.set(id, { revision: snapshot.revision, offset: 0, days: new Map() })
-    }
-  }
-  for (const id of [...folds.keys()]) if (!live.has(id)) folds.delete(id)
-
-  const merged = new Map()
-  for (const entry of folds.values()) mergeDays(merged, entry.days)
-
-  const days = [...merged.values()].sort((left, right) => (left.date < right.date ? -1 : 1))
-  const today = merged.get(localDateKey(Date.now())) ?? emptyBucket(localDateKey(Date.now()))
-  const totals = emptyBucket('total')
-  for (const bucket of days) {
-    totals.input += bucket.input
-    totals.output += bucket.output
-    totals.cacheRead += bucket.cacheRead
-    totals.cacheWrite += bucket.cacheWrite
-    totals.total += bucket.total
-    totals.requests += bucket.requests
-    for (const [provider, child] of Object.entries(bucket.providers)) {
-      const existing = totals.providers[provider] ?? emptyBucket('total')
-      existing.input += child.input
-      existing.output += child.output
-      existing.cacheRead += child.cacheRead
-      existing.cacheWrite += child.cacheWrite
-      existing.total += child.total
-      existing.requests += child.requests
-      totals.providers[provider] = existing
-    }
-  }
+function unavailableUsage(reason = '本组合未挂载 sessionPersistence。') {
+  const day = localDateKey(Date.now())
   return {
-    days,
-    today,
-    totals,
+    available: false,
+    today: emptyBucket(day),
+    totals: emptyBucket('total'),
+    days: [],
+    scan: { sessions: 0, gone: 0, rescanned: 0, skipped: 0, tookMs: 0, warnings: [reason], source: 'none' },
+  }
+}
+
+/**
+ * The panel's usage payload, derived from the ledger alone.
+ *
+ * Memoized on the ledger's own `updatedAt`: one sync window, one merge. A sync
+ * always stamps a new `updatedAt`, so the very next read reflects it.
+ *
+ * @returns {any}
+ */
+function ledgerReport() {
+  const ledger = ledgerRuntime.ledger ?? emptyLedger()
+  if (ledgerRuntime.view.at === ledger.updatedAt && ledgerRuntime.view.value !== undefined) {
+    return ledgerRuntime.view.value
+  }
+  const view = ledgerView(ledger)
+  const rows = Object.values(ledger.sessions ?? {})
+  const last = ledgerRuntime.last
+  const value = {
+    available: true,
+    today: view.today,
+    totals: view.totals,
+    days: view.days,
     scan: {
-      sessions: folds.size,
-      rescanned,
-      tookMs: Date.now() - startedAt,
-      firstDay: days.length > 0 ? days[0].date : undefined,
-      lastDay: days.length > 0 ? days[days.length - 1].date : undefined,
-      warnings,
+      sessions: rows.length,
+      gone: rows.filter((row) => row.goneAt !== null).length,
+      rescanned: last?.read ?? 0,
+      skipped: last?.skipped ?? 0,
+      tookMs: last?.tookMs ?? 0,
+      firstDay: view.days.length > 0 ? view.days[0].date : undefined,
+      lastDay: view.days.length > 0 ? view.days[view.days.length - 1].date : undefined,
+      warnings: ledgerRuntime.warnings.slice(),
+      source: 'ledger',
+      since: ledger.createdAt,
+      updatedAt: ledger.updatedAt,
+      live: view.live,
     },
   }
+  ledgerRuntime.view = { at: ledger.updatedAt, value }
+  return value
+}
+
+/**
+ * Fold usage, reusing the last answer for a short window unless forced.
+ *
+ * `force` is the panel's Refresh button and advances the ledger synchronously. A
+ * plain read advances it only when the last sync is older than `USAGE_TTL_MS`,
+ * which keeps the old "never fold more than once per 15 s" budget while the
+ * numbers themselves come from the ledger.
+ *
+ * @param {any} ctx
+ * @param {boolean} force
+ * @returns {Promise<any>}
+ */
+async function usageReport(ctx, force) {
+  const persistence = ctx.get('sessionPersistence')
+  if (persistence === undefined) return unavailableUsage()
+  const stale = ledgerRuntime.syncedAt === 0 || Date.now() - ledgerRuntime.syncedAt >= USAGE_TTL_MS
+  if (force || stale) {
+    try {
+      await ensureLedgerSynced(persistence)
+    } catch (error) {
+      ledgerRuntime.warnings = ledgerRuntime.warnings
+        .concat(`账本同步失败：${String(error?.message ?? error)}`)
+        .slice(-20)
+    }
+  }
+  if (ledgerRuntime.ledger === undefined) return unavailableUsage('账本尚未建立，且会话日志无法读取。')
+  return ledgerReport()
 }
 
 // ---------------------------------------------------------------------------
@@ -976,34 +896,6 @@ function json(payload, status = 200) {
 }
 
 /**
- * Fold usage, reusing the last answer for a short window unless forced.
- *
- * @param {any} ctx
- * @param {boolean} force
- * @returns {Promise<any>}
- */
-async function usageReport(ctx, force) {
-  if (!force && usageCache.value !== undefined && Date.now() - usageCache.at < USAGE_TTL_MS) {
-    return usageCache.value
-  }
-  const persistence = ctx.get('sessionPersistence')
-  if (persistence === undefined) {
-    const unavailable = {
-      available: false,
-      today: emptyBucket(localDateKey(Date.now())),
-      totals: emptyBucket('total'),
-      days: [],
-      scan: { sessions: 0, rescanned: 0, tookMs: 0, warnings: ['本组合未挂载 sessionPersistence。'] },
-    }
-    return unavailable
-  }
-  const folded = await collectUsage(persistence)
-  const value = { available: true, ...folded }
-  usageCache = { at: Date.now(), value }
-  return value
-}
-
-/**
  * Handler for `GET /api/usage/report`.
  *
  * Kept as the one-call shape for an external consumer: it blocks for a provider
@@ -1085,7 +977,12 @@ async function handleQuota(ctx, request) {
  *
  * @param {any} ctx
  */
-export function apply(ctx) {
+export function apply(ctx, config = {}) {
+  const configured = config?.syncIntervalMs
+  const syncIntervalMs =
+    typeof configured === 'number' && Number.isFinite(configured) && configured >= LEDGER_SYNC_MIN_MS
+      ? Math.round(configured)
+      : LEDGER_SYNC_MS
   for (const [path, handler, label] of [
     ['/api/usage/usage', handleUsage, 'usage route'],
     ['/api/usage/quota', handleQuota, 'quota route'],
@@ -1105,6 +1002,14 @@ export function apply(ctx) {
 
   ctx.effect(() => {
     let stopped = false
+    /** Advance the ledger, ignoring a failure: the next tick retries. */
+    const advance = () => {
+      const persistence = ctx.get('sessionPersistence')
+      if (persistence === undefined) return
+      ensureLedgerSynced(persistence).catch(() => {
+        /* a sync failure is surfaced in the payload's warnings, not thrown here */
+      })
+    }
     const warm = async () => {
       try {
         await usageReport(ctx, true)
@@ -1120,16 +1025,31 @@ export function apply(ctx) {
     const initial = setTimeout(() => {
       if (!stopped) void warm()
     }, WARMUP_DELAY_MS)
-    // Neither timer may hold the Host process open on its own.
+    // No timer may hold the Host process open on its own.
     if (typeof initial.unref === 'function') initial.unref()
-    const interval = setInterval(() => {
+    const quota = setInterval(() => {
       if (!stopped) void revalidateQuota(ctx)
     }, QUOTA_BACKGROUND_MS)
-    if (typeof interval.unref === 'function') interval.unref()
+    if (typeof quota.unref === 'function') quota.unref()
+    // The ledger's own cadence, independent of the provider cadence: usage is a
+    // local fact and must keep advancing even when every provider is unreachable.
+    const ledger = setInterval(() => {
+      if (!stopped) advance()
+    }, syncIntervalMs)
+    if (typeof ledger.unref === 'function') ledger.unref()
     return () => {
       stopped = true
       clearTimeout(initial)
-      clearInterval(interval)
+      clearInterval(quota)
+      clearInterval(ledger)
+      // A shutdown must not drop the tick that just landed in memory.
+      if (ledgerRuntime.ledger !== undefined && ledgerRuntime.path !== undefined) {
+        try {
+          ledgerRuntime.ledger = saveLedgerMerged(ledgerRuntime.path, ledgerRuntime.ledger)
+        } catch {
+          /* the previous successful write stands */
+        }
+      }
     }
   }, 'dsh-usage: cache warm-up')
 }

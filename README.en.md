@@ -49,7 +49,8 @@ HMR. To switch it off, override the row in the profile's own `cordis.patch.yml`:
 
 | Section | Content |
 |---|---|
-| Overview strip | Today's usage, today's cache hits, all-time usage and cache hits (with the cache share of the prompt), the busiest day, and the current and longest run of days |
+| Overview strip | Today's usage, today's cache hits, all-time usage and cache hits (with the cache share of the prompt), the busiest day, and the current and longest run of days — plus a line naming when the ledger started, when it last synced, and what the logs still on disk add up to |
+| Where "all time" comes from | The cumulative figures come from a local ledger (next section): a deleted session is no longer read, but the usage it already contributed never drops back out |
 | History heatmap | Six months, one cell per day — or per week after switching to **Weekly**. Deeper colour means more usage; hover a cell (or focus it from the keyboard) to float that day's or week's usage and cache hits; click one for the full detail below, and step the window with the arrows |
 | API quotas | `kimi-coding` (5-hour window, monthly total), `commandcode` (5-hour, weekly, monthly) and `opencode-go` (rolling 5-hour, weekly, monthly) used share and reset times |
 
@@ -61,6 +62,62 @@ Token counts are always shown as **complete integers** — never abbreviated to 
 
 ![API quotas](docs/panel-quota.png)
 
+## Cumulative usage and the ledger
+
+The all-time figures are not "add up whatever logs exist right now" — they are kept in a
+local ledger:
+
+```text
+<DSH_HOME>/usage-ledger/ledger.json       # ~/.dsh/usage-ledger/ledger.json by default
+<DSH_HOME>/usage-ledger/ledger.json.bak   # the previous successful write
+```
+
+One row per session, holding the day buckets it has contributed and how far into its log
+that contribution has been read. Therefore:
+
+- **deleting a session never lowers the total.** The sync that notices the missing log only
+  stamps `goneAt` on its row; the usage that row already holds stays in the totals;
+- **growth costs a tail read.** A session whose `revision` did not move is not opened at
+  all; one that moved is read from its recorded offset;
+- **an anomaly only warns.** A shorter log, a reordered one, or an unreadable one is skipped
+  with a warning in the panel's footer — the credit already given never goes back;
+- **it syncs every 10 minutes** (configurable through `syncIntervalMs`, floor 60 seconds),
+  and the panel's Refresh advances it immediately;
+- writes are temp-file-plus-rename with a `.bak` copy, and two windows sharing one home are
+  merged per session by "whichever row read further", so neither can rewind the other into
+  double counting;
+- **a session that changes id spelling is still one row.** Early Harness ids were bare UUIDs
+  and later ones carry a `session-` prefix, so one machine can hold both: rows are keyed by the
+  directory name verbatim, a session that reappears under the other spelling has its row
+  *renamed* (credit kept), and a save merges the two spellings back into a single row.
+
+The `on disk now` line under the strip is the same merge restricted to sessions whose logs
+are still there. The difference between the two numbers is exactly the sessions that were
+deleted but are still remembered.
+
+Deleting `ledger.json` and `ledger.json.bak` resets the ledger (the total then restarts
+from what is on disk).
+
+### Seeding or backfilling without Harness running
+
+`tools/seed-ledger.mjs` uses the same fold as the panel to advance the ledger from a
+directory of session logs:
+
+```bash
+node tools/seed-ledger.mjs                      # build / advance from this machine's logs
+node tools/seed-ledger.mjs --backfill --from <a backed-up sessions directory>
+```
+
+`--backfill` is **add-only**: sessions present in the backup but absent from the ledger are
+credited as already-gone rows (no session file is copied or restored), while ids the ledger
+already knows are left exactly as they are, so running it twice is a no-op. `--dry-run`
+prints the outcome without writing.
+
+The data model, the sync loop, the exact edges of "credit only grows", and why this is not
+SQLite are written up in [docs/token-ledger.md](docs/token-ledger.md); the traps this change ran
+into (deleted sessions, a changed id spelling, the profile's `link:` dependency) are in
+[docs/project-log/log.md](docs/project-log/log.md).
+
 ## Speed
 
 The panel never waits. The two halves differ in cost by three orders of magnitude, so
@@ -68,7 +125,7 @@ they are requested separately:
 
 | Half | Measured |
 |---|---|
-| Local fold (reading this machine's session logs) | tens of milliseconds |
+| Local data (the ledger; logs only when one grew) | 2.7 s to build, then 1-50 ms |
 | Provider quota (one overseas round trip) | usually 0.2-2 s, up to 10 s when the path jitters |
 
 Therefore:
@@ -83,8 +140,9 @@ Therefore:
   come back for the fresh answer);
 - activation warms both caches 2.5 seconds after boot and revalidates every 5 minutes,
   so **opening Settings is usually a cache hit**;
-- session logs are folded incrementally by `revision`: a log that merely grew costs one
-  tail read instead of a full re-read.
+- all-time usage is read from the local ledger, which **opens no log at all while idle**
+  (149 sessions: 2 ms of syncing, 49 ms for the whole request) and reads only the new tail
+  when one grows.
 
 Network jitter never becomes a red card: each read gets its own **20-second** deadline and
 one **retry** when it times out or the socket drops (both requests are idempotent GETs),
@@ -104,7 +162,8 @@ deadline is exactly what turned the card into "the provider did not answer in ti
 - Cache hits are that accounting's cache-read share.
 - Days are bucketed by **local timezone** calendar day; **weekly** folds them into ISO weeks (Monday to Sunday).
 - Data comes from the Host's `sessionPersistence` service — the compressed on-disk
-  session format is never re-implemented here.
+  session format is never re-implemented here — and is folded into the local ledger that
+  the panel then reads.
 
 ## Layout
 
@@ -113,9 +172,14 @@ package.json       bundle manifest (dsh.bundle.patch + dsh.client)
 cordis.patch.yml   one insert row: mounts the host half
 index.js           host half: /api/usage/usage, /api/usage/quota, /api/usage/report
 client.js          browser half: the settings.section page (build-free lazy CJS bundle)
+lib/ledger.js      the incremental ledger: fold, sync, merge, atomic read/write
+tools/seed-ledger.mjs  build the ledger, or backfill it from a backup, without Harness
 icon.svg           bundle icon
 locale/*.json      plugin-manager title and description
-docs/              panel shots produced by test/preview.mjs
+docs/              panel shots produced by test/preview.mjs, the ledger design note,
+                   and the project log
+  token-ledger.md  the ledger's data model, sync algorithm and edge cases
+  project-log/     the project log (append-only)
 test/selfcheck.mjs activation self-check
 test/preview.mjs   static preview: renders the real component tree to HTML
 ```
@@ -141,6 +205,11 @@ parsers, that one timeout really does cost exactly one retry, that two failed ro
 the previous good numbers and their failure reason, that a configuration change (a removed
 key) is never papered over with old numbers, that the five requests really do overlap, that
 the local half touches no network, and the section's id / order / label / component type.
+A separate ledger section asserts the whole "credit only grows" contract: bootstrap equals a
+full fold, an unchanged session is never opened, growth is credited exactly once, a deletion
+never lowers the total, a restored session resumes from its offset, a shorter or reordered log
+only warns, two ledgers merge towards the row that read further, a corrupt file falls back to
+`.bak`, and the strip's ledger caption renders.
 The browser half additionally asserts the heatmap's window, week columns, ISO weeks, shades,
 weekly aggregation and day runs, plus the rendered grid's cell count, `aria-label`s, legend
 and toggles. Exit code 0 means all checks passed.

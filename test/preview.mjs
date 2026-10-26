@@ -116,7 +116,29 @@ const toHtml = (node) => {
   return `<${tag}${attributes.join('')}>${toHtml(props?.children)}</${tag}>`
 }
 
-const strip = toHtml(StatStrip({ today: todayBucket, totals, days, available: true }))
+// The preview mirrors a host answer, so it carries the ledger's scan block too:
+// without it the strip's caption line (ledger start, last sync, on-disk figure)
+// would be the one part of the card the shots never show.
+const scan = {
+  sessions: 318,
+  gone: 169,
+  rescanned: 1,
+  skipped: 317,
+  tookMs: 24,
+  firstDay: days[0].date,
+  lastDay: days[days.length - 1].date,
+  warnings: [],
+  source: 'ledger',
+  since: Date.now() - 2 * 86_400_000,
+  updatedAt: Date.now() - 60_000,
+  live: {
+    sessions: 149,
+    total: Math.round(totals.total * 0.31),
+    cacheRead: Math.round(totals.cacheRead * 0.31),
+    requests: Math.round(totals.requests * 0.31),
+  },
+}
+const strip = toHtml(StatStrip({ today: todayBucket, totals, days, available: true, scan }))
 const daily = toHtml(Activity({ days, grain: 'day', onGrain: () => {}, selected: { grain: 'day', key: todayBucket.date }, onSelect: () => {} }))
 const weekly = toHtml(Activity({ days, grain: 'week', onGrain: () => {}, selected: { grain: 'week', key: '2026-10-19' }, onSelect: () => {} }))
 const detail = toHtml(SelectionDetail({ grain: 'day', point: todayBucket.date, bucket: todayBucket }))

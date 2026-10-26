@@ -1,9 +1,9 @@
 {
   "name": "@local/dsh-usage",
-  "version": "1.4.0",
+  "version": "1.5.0",
   "private": true,
   "type": "module",
-  "description": "用量 · Usage — DeepSeek Harness (DSH) 设置面板：当日与累计的 token 用量、缓存命中、历史用量热力图，以及已接入 API（kimi-coding、commandcode、opencode-go）的额度与刷新时间。 A DSH settings panel for token usage, cache hits, a usage heatmap, and provider quotas.",
+  "description": "用量 · Usage — DeepSeek Harness (DSH) 设置面板：当日与累计的 token 用量（累计记在本机账本里，删除会话不会让数字变小）、缓存命中、历史用量热力图，以及已接入 API（kimi-coding、commandcode、opencode-go）的额度与刷新时间。 A DSH settings panel for token usage kept in a local append-only ledger, cache hits, a usage heatmap, and provider quotas.",
   "icon": "./icon.svg",
   "license": "MIT",
   "repository": {
@@ -31,6 +31,7 @@
   "exports": {
     ".": "./index.js",
     "./client": "./client.js",
+    "./ledger": "./lib/ledger.js",
     "./package.json": "./package.json",
     "./icon.svg": "./icon.svg",
     "./locale/*.json": "./locale/*.json"
@@ -38,6 +39,8 @@
   "files": [
     "index.js",
     "client.js",
+    "lib/ledger.js",
+    "tools/seed-ledger.mjs",
     "cordis.patch.yml",
     "icon.svg",
     "locale/*.json",
@@ -45,10 +48,12 @@
     "README.en.md",
     "LICENSE",
     "docs/*.png",
+    "docs/*.md",
     "test/*.mjs"
   ],
   "scripts": {
-    "test": "node test/selfcheck.mjs"
+    "test": "node test/selfcheck.mjs",
+    "ledger": "node tools/seed-ledger.mjs"
   },
   "engines": {
     "node": ">=20"

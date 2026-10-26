@@ -7,6 +7,14 @@
 #
 #   - id: usage-panel
 #     disabled: true
+#
+# The cumulative figures come from an append-only ledger under
+# `$DSH_HOME/usage-ledger/`, advanced in the background every `syncIntervalMs`
+# (default 600000 = 10 minutes, floor 60000):
+#
+#   - id: usage-panel
+#     config:
+#       syncIntervalMs: 600000
 
 - insert:
     - id: usage-panel

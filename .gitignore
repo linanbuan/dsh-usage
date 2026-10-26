@@ -16,4 +16,5 @@ Thumbs.db
 pnpm-lock.yaml
 
 # 只在本机，不进公开仓库
+AGENTS.md
 AI推送须知.md

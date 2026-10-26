@@ -4,11 +4,19 @@
 //
 //   node test/selfcheck.mjs
 import { pathToFileURL } from 'node:url';
-import { readFileSync } from 'node:fs';
+import { readFileSync, rmSync } from 'node:fs';
+import { tmpdir } from 'node:os';
 import { dirname, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 
 const BUNDLE = dirname(dirname(fileURLToPath(import.meta.url)));
+
+// The ledger is durable state, so the self-check must never write into the
+// operator's own home: point it at a throwaway directory before the host half
+// is ever loaded.
+const LEDGER_DIR = join(tmpdir(), `dsh-usage-selfcheck-${String(process.pid)}`);
+rmSync(LEDGER_DIR, { recursive: true, force: true });
+process.env.DSH_USAGE_LEDGER = join(LEDGER_DIR, 'ledger.json');
 void join;
 let failures = 0;
 const check = (label, condition, detail) => {
@@ -392,6 +400,286 @@ check('opencode-go weekly share = 25%', ocWindows.find((w) => w.id === '7d')?.us
 check('opencode-go monthly share = 63.5%', ocWindows.find((w) => w.id === 'monthTotal')?.used === 0.635, String(ocWindows.find((w) => w.id === 'monthTotal')?.used));
 
 // ---------------------------------------------------------------------------
+// A2. Incremental ledger
+//
+// The ledger is the only source of the panel's cumulative figures, so its
+// invariants are asserted directly: credit only grows, an unchanged session is
+// never opened, and a session that disappears keeps its numbers.
+// ---------------------------------------------------------------------------
+console.log('\nA2. incremental ledger');
+
+const ledgerModule = await import(pathToFileURL(`${BUNDLE}/lib/ledger.js`).href);
+const {
+  emptyLedger,
+  ledgerView,
+  loadLedgerFile,
+  localDateKey,
+  mergeLedgers,
+  normalizeLedger,
+  resolveLedgerPath,
+  saveLedgerFile,
+  saveLedgerMerged,
+  syncLedger,
+} = ledgerModule;
+
+/** One billed attempt, shaped like an assistant/message event. */
+const attempt = (seq, input, token = 'x') => ({
+  type: 'assistant/message',
+  seq,
+  time: Date.now(),
+  data: {
+    usage: { inputTokens: input, outputTokens: 0, cacheReadTokens: 0, cacheWriteTokens: 0 },
+    message: { source: { provider: 'test-' + token } },
+  },
+});
+
+/**
+ * A fake persistence whose sessions can be added, appended to, truncated and
+ * removed, and which counts every log it opens.
+ */
+function fakePersistence() {
+  const sessions = new Map();
+  const opened = [];
+  return {
+    opened,
+    sessions,
+    /** @param {string} id @param {any[]} events */
+    put(id, events) {
+      sessions.set(id, { events: events.slice(), revision: `${id}-${String(Math.random())}` });
+      return this;
+    },
+    /** @param {string} id @param {any[]} events */
+    append(id, events) {
+      const entry = sessions.get(id);
+      entry.events = entry.events.concat(events);
+      entry.revision = `${id}-${String(Math.random())}`;
+      return this;
+    },
+    /** @param {string} id */
+    drop(id) {
+      sessions.delete(id);
+      return this;
+    },
+    async list() {
+      return [...sessions.entries()].map(([id, entry]) => ({
+        header: { id },
+        revision: entry.revision,
+        sizeBytes: entry.events.length * 100,
+      }));
+    },
+    async open(id) {
+      opened.push(id);
+      const entry = sessions.get(id);
+      if (entry === undefined) throw new Error('no such session: ' + id);
+      return {
+        async read(offset, length) {
+          return { events: entry.events.filter((event) => event.seq >= offset).slice(0, length) };
+        },
+        async close() {},
+      };
+    },
+  };
+}
+
+const storeA = fakePersistence().put('session-1', [attempt(0, 10), attempt(1, 20), attempt(2, 30)]);
+storeA.put('session-2', [attempt(0, 100)]);
+const firstLedger = emptyLedger();
+const firstSync = await syncLedger(storeA, firstLedger);
+const firstView = ledgerView(firstLedger);
+check('ledger: bootstrap folds every session once', firstView.totals.total === 160, String(firstView.totals.total));
+check('ledger: rows are keyed by session id', Object.keys(firstLedger.sessions).sort().join(',') === 'session-1,session-2');
+check('ledger: bootstrap leaves nothing gone', firstView.live.sessions === 2 && firstSync.gone === 0, JSON.stringify(firstSync));
+check('ledger: createdAt and updatedAt are stamped', firstLedger.createdAt > 0 && firstLedger.updatedAt > 0);
+
+const opensAfterBootstrap = storeA.opened.length;
+const idleSync = await syncLedger(storeA, firstLedger);
+check(
+  'ledger: an unchanged session is never opened',
+  storeA.opened.length === opensAfterBootstrap && idleSync.read === 0 && idleSync.skipped === 2,
+  JSON.stringify({ opened: storeA.opened.length, idleSync }),
+);
+check('ledger: an idle sync leaves the total alone', ledgerView(firstLedger).totals.total === 160);
+
+storeA.append('session-1', [attempt(3, 40), attempt(4, 50)]);
+const growthSync = await syncLedger(storeA, firstLedger);
+const grownView = ledgerView(firstLedger);
+check(
+  'ledger: growth is credited exactly once (160 + 90)',
+  grownView.totals.total === 250,
+  String(grownView.totals.total),
+);
+check('ledger: growth reads only the session that moved', growthSync.read === 1 && growthSync.skipped === 1, JSON.stringify(growthSync));
+check('ledger: the offset advances past the new events', firstLedger.sessions['session-1'].offset === 5, String(firstLedger.sessions['session-1']?.offset));
+
+// A plain re-sync must be idempotent, which is what makes the timer safe.
+await syncLedger(storeA, firstLedger);
+check('ledger: a second sync does not double count', ledgerView(firstLedger).totals.total === 250, String(ledgerView(firstLedger).totals.total));
+
+storeA.drop('session-2');
+const deleteSync = await syncLedger(storeA, firstLedger);
+const afterDelete = ledgerView(firstLedger);
+check(
+  'ledger: deleting a session never lowers the total',
+  afterDelete.totals.total === 250 && deleteSync.gone === 1,
+  JSON.stringify({ total: afterDelete.totals.total, gone: deleteSync.gone }),
+);
+check('ledger: the deleted row is marked, not dropped', typeof firstLedger.sessions['session-2'].goneAt === 'number');
+check('ledger: the live figure excludes the deleted session', afterDelete.live.total === 250 - 100 && afterDelete.live.sessions === 1, JSON.stringify(afterDelete.live));
+
+// The same id coming back (a restore from a backup) must resume, not re-credit.
+storeA.put('session-2', [attempt(0, 100), attempt(1, 60)]);
+await syncLedger(storeA, firstLedger);
+const restored = ledgerView(firstLedger);
+check(
+  'ledger: a restored session resumes from its offset (only +60)',
+  restored.totals.total === 310 && firstLedger.sessions['session-2'].goneAt === null,
+  JSON.stringify({ total: restored.totals.total, goneAt: firstLedger.sessions['session-2'].goneAt }),
+);
+
+// A shorter log is a rewrite, a migration or an external truncation — never a
+// reason to hand credit back.
+storeA.put('session-1', [attempt(0, 10)]);
+const shrinkSync = await syncLedger(storeA, firstLedger);
+check(
+  'ledger: a shorter log keeps its credit and warns',
+  ledgerView(firstLedger).totals.total === 310 && shrinkSync.warnings.length === 1,
+  JSON.stringify({ total: ledgerView(firstLedger).totals.total, warnings: shrinkSync.warnings }),
+);
+
+// A reordered log cannot be advanced safely, so it is skipped rather than guessed.
+storeA.put('session-3', [attempt(0, 1), attempt(1, 2)]);
+await syncLedger(storeA, firstLedger);
+const beforeReorder = ledgerView(firstLedger).totals.total;
+storeA.put('session-3', [attempt(7, 1), attempt(8, 2), attempt(9, 4)]);
+const reorderSync = await syncLedger(storeA, firstLedger);
+check(
+  'ledger: a reordered log is skipped with a warning',
+  ledgerView(firstLedger).totals.total === beforeReorder && reorderSync.warnings.some((line) => line.includes('seq')),
+  JSON.stringify({ total: ledgerView(firstLedger).totals.total, warnings: reorderSync.warnings }),
+);
+
+// Two Host processes: the row that consumed more events wins, so a stale writer
+// can never rewind (and therefore re-credit) another process's work.
+const ahead = normalizeLedger(JSON.parse(JSON.stringify(firstLedger)));
+const behind = normalizeLedger(JSON.parse(JSON.stringify(firstLedger)));
+ahead.sessions['session-1'].offset = 99;
+behind.sessions['session-1'].offset = 1;
+const merged = mergeLedgers(ahead, behind);
+check('ledger: merging keeps the more advanced row', merged.sessions['session-1'].offset === 99, String(merged.sessions['session-1'].offset));
+check('ledger: merging keeps the earlier createdAt', merged.createdAt === Math.min(ahead.createdAt, behind.createdAt));
+
+// Two rows at the same offset hold the same credit, so the tie-break has to keep
+// the fresher *description* of it. If a stale revision won a tie, every following
+// sync would see "changed", re-open every log it had just finished reading, and
+// the 24 ms idle tick would silently become a 3 s full scan.
+const staleCopy = normalizeLedger(JSON.parse(JSON.stringify(firstLedger)));
+const freshCopy = normalizeLedger(JSON.parse(JSON.stringify(firstLedger)));
+staleCopy.sessions['session-1'].revision = 'r-stale';
+staleCopy.sessions['session-1'].lastSeenAt = 1_000;
+freshCopy.sessions['session-1'].revision = 'r-fresh';
+freshCopy.sessions['session-1'].lastSeenAt = 5_000;
+check(
+  'ledger: a tie keeps the fresher revision (either merge order)',
+  mergeLedgers(staleCopy, freshCopy).sessions['session-1'].revision === 'r-fresh' &&
+    mergeLedgers(freshCopy, staleCopy).sessions['session-1'].revision === 'r-fresh',
+  JSON.stringify([
+    mergeLedgers(staleCopy, freshCopy).sessions['session-1'].revision,
+    mergeLedgers(freshCopy, staleCopy).sessions['session-1'].revision,
+  ]),
+);
+check(
+  'ledger: a tie keeps the fresher gone mark',
+  mergeLedgers(
+    Object.assign(normalizeLedger(JSON.parse(JSON.stringify(staleCopy))), {}),
+    (() => {
+      const gone = normalizeLedger(JSON.parse(JSON.stringify(freshCopy)))
+      gone.sessions['session-1'].goneAt = 9_000
+      return gone
+    })(),
+  ).sessions['session-1'].goneAt === 9_000,
+);
+
+// Harness ids grew a 'session-' prefix partway through 2026, so one machine can
+// hold logs of both vintages. A row filed under the other spelling is the same
+// session: it must be renamed and keep its credit, never seen as a new session
+// (which would re-credit its whole history and roughly double the total).
+const renameStore = fakePersistence().put('session-old', [attempt(0, 7), attempt(1, 9)]);
+const renameLedger = emptyLedger();
+await syncLedger(renameStore, renameLedger);
+renameStore.drop('session-old');
+renameStore.put('old', [attempt(0, 7), attempt(1, 9)]);
+const adoptSync = await syncLedger(renameStore, renameLedger);
+check(
+  'ledger: a session that changes id spelling keeps its credit',
+  ledgerView(renameLedger).totals.total === 16 &&
+    adoptSync.adopted === 1 &&
+    adoptSync.gone === 0 &&
+    Object.keys(renameLedger.sessions).join(',') === 'old',
+  JSON.stringify({ sync: adoptSync, rows: Object.keys(renameLedger.sessions), total: ledgerView(renameLedger).totals.total }),
+);
+
+// The rename only lives in the writer's memory; the file still has the old key,
+// and a plain merge would resurrect it. Collapsing the pair on merge is what keeps
+// the saved document — not just the running process — free of double counting.
+const twinLeft = emptyLedger();
+await syncLedger(fakePersistence().put('abc', [attempt(0, 5), attempt(1, 6)]), twinLeft);
+const twinRight = emptyLedger();
+await syncLedger(fakePersistence().put('session-abc', [attempt(0, 5), attempt(1, 6)]), twinRight);
+const twinMerged = mergeLedgers(twinLeft, twinRight);
+check(
+  'ledger: merging two spellings of one session leaves one row',
+  Object.keys(twinMerged.sessions).length === 1 &&
+    twinMerged.sessions['session-abc'] !== undefined &&
+    ledgerView(twinMerged).totals.total === 11,
+  JSON.stringify({ rows: Object.keys(twinMerged.sessions), total: ledgerView(twinMerged).totals.total }),
+);
+
+check(
+  'ledger: a malformed document is repaired, not thrown',
+  normalizeLedger({ sessions: { x: { offset: 'nonsense', days: { bad: null } } } }).sessions.x.offset === 0,
+);
+check('ledger: a non-object document becomes an empty ledger', Object.keys(normalizeLedger(null).sessions).length === 0);
+check(
+  'ledger: the path honours DSH_USAGE_LEDGER over DSH_HOME',
+  resolveLedgerPath({ DSH_USAGE_LEDGER: 'C:/tmp/a.json', DSH_HOME: 'C:/home' }, 'C:/users/x') === 'C:/tmp/a.json' &&
+    resolveLedgerPath({ DSH_HOME: 'C:/home' }, 'C:/users/x').includes('usage-ledger'),
+);
+
+// The file layer: atomic write, .bak fallback, and merge-on-save.
+const ledgerFile = join(LEDGER_DIR, 'store', 'ledger.json');
+saveLedgerFile(ledgerFile, firstLedger);
+const reloaded = loadLedgerFile(ledgerFile);
+check(
+  'ledger store: a save/load round trip keeps the totals',
+  ledgerView(reloaded.ledger).totals.total === ledgerView(firstLedger).totals.total &&
+    reloaded.warnings.length === 0,
+  String(ledgerView(reloaded.ledger).totals.total),
+);
+const { existsSync } = await import('node:fs');
+saveLedgerFile(ledgerFile, firstLedger);
+check('ledger store: no temp file is left behind', !existsSync(ledgerFile + '.tmp'));
+check('ledger store: the previous file is kept as .bak', existsSync(ledgerFile + '.bak'));
+const { writeFileSync } = await import('node:fs');
+writeFileSync(ledgerFile, '{ not json', 'utf8');
+const recoveredFile = loadLedgerFile(ledgerFile);
+check(
+  'ledger store: a corrupt file falls back to .bak',
+  ledgerView(recoveredFile.ledger).totals.total === ledgerView(firstLedger).totals.total &&
+    recoveredFile.warnings.length > 0,
+  JSON.stringify(recoveredFile.warnings),
+);
+const olderCopy = normalizeLedger(JSON.parse(JSON.stringify(firstLedger)));
+olderCopy.sessions['session-1'].offset = 0;
+olderCopy.sessions['session-1'].days = {};
+const written = saveLedgerMerged(ledgerFile, olderCopy);
+check(
+  'ledger store: saving an older copy cannot rewind the file',
+  written.sessions['session-1'].offset === firstLedger.sessions['session-1'].offset &&
+    ledgerView(loadLedgerFile(ledgerFile).ledger).totals.total === ledgerView(firstLedger).totals.total,
+  JSON.stringify({ offset: written.sessions['session-1'].offset, total: ledgerView(loadLedgerFile(ledgerFile).ledger).totals.total }),
+);
+
+// ---------------------------------------------------------------------------
 // B. Browser half
 // ---------------------------------------------------------------------------
 console.log('\nB. browser half (client.js)');
@@ -670,6 +958,39 @@ check('the strip names today and the window totals', stripBlob.includes('6') && 
 check('the strip reports the busiest day', stripBlob.includes('100'), stripBlob.slice(0, 200));
 check('the strip counts the run of days', stripBlob.includes('2 天'), stripBlob.slice(0, 200));
 check('no figure falls back to NaN or undefined', !stripBlob.includes('NaN') && !stripBlob.includes('undefined'), stripBlob.slice(0, 200));
+
+// The ledger caption is what makes "all time" larger than "on disk" legible:
+// without it, a total that survives a deletion looks like a bug.
+const ledgerStrip = StatStrip({
+  today: { date: today, total: 0, input: 0, output: 0, cacheRead: 0, cacheWrite: 0, requests: 0, providers: {} },
+  totals: { input: 1, output: 1, cacheRead: 1, cacheWrite: 0, total: 3, requests: 1 },
+  days: [],
+  available: true,
+  scan: {
+    source: 'ledger',
+    since: Date.now() - 86_400_000,
+    updatedAt: Date.now(),
+    gone: 3,
+    live: { sessions: 149, total: 1234, cacheRead: 0, requests: 2 },
+  },
+});
+const ledgerText = [];
+let ledgerCaptionNode;
+walk(ledgerStrip, (node) => {
+  if (typeof node.props?.className === 'string' && node.props.className.includes('dsu-stripLedger')) ledgerCaptionNode = node;
+  if (typeof node.props?.children === 'string') ledgerText.push(node.props.children);
+});
+const ledgerBlob = ledgerText.join(' | ');
+check('the strip renders the ledger caption', ledgerCaptionNode !== undefined);
+check('the caption names the ledger start and its last sync', ledgerBlob.includes('账本自') && ledgerBlob.includes('更新于'), ledgerBlob.slice(0, 240));
+check('the caption prints the on-disk figure and session count', ledgerBlob.includes('1234') && ledgerBlob.includes('149'), ledgerBlob.slice(0, 240));
+check('the caption counts the deleted sessions', ledgerBlob.includes('已删除 3 个会话'), ledgerBlob.slice(0, 240));
+const plainStrip = StatStrip({ today: {}, totals: {}, days: [], available: true });
+const plainText = [];
+walk(plainStrip, (node) => {
+  if (typeof node.props?.className === 'string' && node.props.className.includes('dsu-stripLedger')) plainText.push('caption');
+});
+check('no caption when the host reports no ledger', plainText.length === 0);
 
 delete globalThis.window;
 console.log(`\n${failures === 0 ? 'ALL CHECKS PASSED' : `${String(failures)} CHECK(S) FAILED`}`);

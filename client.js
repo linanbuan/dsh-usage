@@ -99,6 +99,11 @@ window.__ModuleLoader__.load({
         timeZone: '时区',
         sessions: '会话',
         note: '总用量 = 输入 + 缓存读取 + 缓存写入 + 输出；缓存命中为其中的缓存读取部分。',
+        ledgerSince: '账本自 {at} 起',
+        ledgerUpdated: '更新于 {at}',
+        ledgerLive: '本机现存日志 {total}（{sessions} 个会话）',
+        ledgerGone: '已删除 {n} 个会话，其用量仍计入累计',
+        ledgerNote: '累计来自本机账本：会话被删除后不再重读，但已记的用量不会回退。',
         weekdays: '一二三四五六日',
         todayBadge: '今天',
       },
@@ -164,6 +169,11 @@ window.__ModuleLoader__.load({
         timeZone: 'Time zone',
         sessions: 'Sessions',
         note: 'Total = input + cache read + cache write + output; cache hits are the cache-read share of it.',
+        ledgerSince: 'ledger from {at}',
+        ledgerUpdated: 'updated {at}',
+        ledgerLive: 'on disk now: {total} ({sessions} sessions)',
+        ledgerGone: '{n} deleted sessions still count',
+        ledgerNote: 'All-time figures come from this machine’s ledger: a deleted session is no longer read, but the usage it contributed never drops back out.',
         weekdays: 'MTWTFSS',
         todayBadge: 'today',
       },
@@ -210,6 +220,19 @@ window.__ModuleLoader__.load({
      */
     function trn(key, value) {
       return tr(key).replace('{n}', String(value))
+    }
+
+    /**
+     * `tr` for strings with named slots (`{at}`, `{total}`, `{sessions}`).
+     *
+     * @param {string} key
+     * @param {Record<string, string|number>} values
+     * @returns {string}
+     */
+    function trf(key, values) {
+      let text = tr(key)
+      for (const [name, value] of Object.entries(values)) text = text.split('{' + name + '}').join(String(value))
+      return text
     }
 
     /** Re-render on a locale switch (locale service when present, `lang` as the fallback). */
@@ -866,19 +889,54 @@ window.__ModuleLoader__.load({
     // -----------------------------------------------------------------------
 
     /**
+     * Why "all time" can exceed what the logs add up to, and when it last moved.
+     *
+     * The panel's cumulative figures come from the ledger, so a session deleted
+     * from disk keeps its usage. That is only legible if the page says so: the
+     * line names the ledger's start, its last sync, the figure the on-disk logs
+     * alone would give, and how many sessions are only remembered.
+     *
+     * @param {any} scan the host's `usage.scan`.
+     * @returns {ReturnType<typeof h>|null}
+     */
+    function ledgerCaption(scan) {
+      if (scan?.source !== 'ledger') return null
+      const live = scan.live ?? {}
+      // The interesting start is the first day the ledger *covers* (which the
+      // backfill can push well before the day the file was created), not the
+      // moment the file appeared.
+      const since =
+        typeof scan.firstDay === 'string' && /^\d{4}-\d{2}-\d{2}$/.test(scan.firstDay)
+          ? scan.firstDay.slice(5)
+          : stamp(scan.since)
+      const parts = [trf('ledgerSince', { at: since })]
+      if (typeof scan.updatedAt === 'number') parts.push(trf('ledgerUpdated', { at: stamp(scan.updatedAt) }))
+      if (typeof live.total === 'number') {
+        parts.push(trf('ledgerLive', { total: plain(live.total), sessions: plain(live.sessions) }))
+      }
+      if ((scan.gone ?? 0) > 0) parts.push(trn('ledgerGone', plain(scan.gone)))
+      return h(
+        'p',
+        { className: 'dsu-hint dsu-stripLedger', title: tr('ledgerNote') },
+        parts.join(' · '),
+      )
+    }
+
+    /**
      * The headline strip: today, all time, the busiest day and the streak.
      *
      * One card, because the two cards this replaces were read as two different
      * seasons; the cache figures ride as the hint under the usage they belong to,
      * which keeps them just as visible without a third card.
      *
-     * @param {{ today: any, totals: any, days: any[], available: boolean }} props
+     * @param {{ today: any, totals: any, days: any[], available: boolean, scan?: any }} props
      */
     function StatStrip(props) {
       useLocaleVersion()
       const today = props.today ?? {}
       const totals = props.totals ?? {}
       const days = props.days ?? []
+      const scan = props.scan ?? {}
       const derived = useMemo(() => {
         let busiest
         for (const bucket of days) {
@@ -934,6 +992,7 @@ window.__ModuleLoader__.load({
           h('span', null, `${tr('today')} ${breakdown(today)}`),
           h('span', null, `${tr('allTime')} ${breakdown(totals)}`),
         ),
+        ledgerCaption(scan),
         props.available ? null : h('p', { className: 'dsu-hint dsu-warnText' }, tr('unavailable')),
       )
     }
@@ -1718,7 +1777,13 @@ window.__ModuleLoader__.load({
         'div',
         { className: 'dsu-root' },
         header,
-        h(StatStrip, { today: usage.today, totals: usage.totals, days, available: usage.available === true }),
+        h(StatStrip, {
+          today: usage.today,
+          totals: usage.totals,
+          days,
+          available: usage.available === true,
+          scan: usage.scan,
+        }),
         h(Activity, {
           days,
           grain,
