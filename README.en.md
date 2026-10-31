@@ -40,7 +40,7 @@ It runs in the background and reads local files — the usage figures this panel
 This is a standard DSH bundle (`package.json` declares `dsh.bundle.patch` and `dsh.client`),
 and the desktop app can install it straight from GitHub — no manual plugin download needed:
 
-1. Open the **DSH desktop** → **Plugins** in the sidebar → **Add plugin** → **Install third-party plugin**;
+1. Open the **DSH desktop** → **Plugins** in the sidebar → **Add plugin** → **Install a third-party plugin**;
 2. Enter this repository's URL in "Package name or address": `https://github.com/linanbuan/dsh-usage`
    (the field also accepts npm package names and absolute local directory paths);
 3. Click **Install** and **restart DSH** when prompted so the host half loads.
