@@ -1,4 +1,4 @@
-# 增量式 Token 账本（dsh-usage 1.5.0 · 已实施）
+# 增量式 Token 账本（dsh-usage 1.5.0 起，1.6.0 迁址 · 已实施）
 
 > 目标读者：要动手改 `index.js` / `client.js` 的人（也包括三个月后的我自己）。
 > 本文给出**可执行的实现口径**：数据模型、每轮同步算法、调度、原子写、面板改动、验证方式。
@@ -37,6 +37,22 @@
 会话从磁盘消失只打标记、绝不扣减。实测建账一次 2.1–3.1 s，之后空闲 tick **2 ms、零日志读取**（含请求 49 ms），
 面板读取合并 0.08 ms，账本文件约 70 KB / 149 会话（≈0.46 KB/会话）。
 
+## 0.6 1.6.0：账本迁到每用户数据目录
+
+1.5.0 把账本写在 `$DSH_HOME/usage-ledger/` 下，它跟着 Harness 的 home 走：换一个 home、卸载重装 DSH，就等于换了一份账本，
+面板上的累计会看起来倒退。1.6.0 把账本迁到**每用户的操作系统数据目录**，刻意同时离开插件目录和 DSH home；
+旧位置的账本在首次加载时合并进来，原文件不移动也不删除。
+
+| 位置 | 内容 |
+|---|---|
+| `lib/ledger.js` | `resolveDataRoot` / `resolveLedgerPath`（忽略 `DSH_HOME`）、`resolveLegacyLedgerPaths`、`resolveImportRecordPath`、`loadLedgerWithInheritance`、`imported.json` 读写 |
+| `index.js` | 首次加载走 `loadLedgerWithInheritance`；响应里的 `scan.ledgerPath` 把账本路径交给面板 |
+| `client.js` | 说明行的浮层显示账本文件路径，并写明卸载插件 / 重装 DSH 都不会丢 |
+| `tools/seed-ledger.mjs` | 与面板同一个缺省路径，同样继承旧账本；`--dry-run` 不导入也不写盘 |
+| `test/selfcheck.mjs` | 存储位置、继承与「卸载 + 重装后累计不变」的断言 |
+
+落点表、回退顺序与继承规则见 §3.1；配置文件口径见 §5；写盘与多实例见 §6。
+
 ## 1. 目标与非目标
 
 目标：
@@ -72,8 +88,8 @@
 
 ## 3. 数据模型
 
-账本文件：`<DSH_HOME>/usage-ledger/ledger.json`（`DSH_HOME` = 环境变量，缺省 `~/.dsh`；测试用 `DSH_USAGE_LEDGER` 覆盖）。
-同目录保留 `ledger.json.bak`（上一次成功写盘的副本）。
+账本文件放在**每用户的操作系统数据目录**（§3.1）：`…/dsh-usage/ledger.json`。同目录另外两个文件：
+`ledger.json.bak`（上一次成功写盘的副本）与 `imported.json`（旧账本的导入记录，见 §3.1）。
 
 ```jsonc
 {
@@ -114,6 +130,42 @@
 - **每会话按天 + provider 拆开存**，因为面板的选中日明细要显示 provider 构成（`client.js` 的 `dsu-providers`）。
 - 体积：69 KB / 149 会话 ≈ 0.46 KB/会话，2000 会话约 1 MB，全天候读写无压力。
 
+### 3.1 账本放在哪（1.6.0）
+
+`resolveLedgerPath()` 先看 `$DSH_USAGE_LEDGER`（给的是**完整文件路径**，测试或确实要指向别处时的逃生门），
+否则落在每用户数据目录下的 `dsh-usage/ledger.json`：
+
+| 平台 | 缺省位置 | 回退 |
+|---|---|---|
+| Windows | `%LOCALAPPDATA%\dsh-usage\ledger.json` | `%APPDATA%\dsh-usage\ledger.json` → `%USERPROFILE%\AppData\Local\dsh-usage\ledger.json` |
+| macOS | `~/Library/Application Support/dsh-usage/ledger.json` | —— |
+| Linux / 其他 | `$XDG_DATA_HOME/dsh-usage/ledger.json` | 缺省 `~/.local/share/dsh-usage/ledger.json` |
+
+**离开 DSH home 是刻意的**：插件目录与 DSH home 都可能随卸载 / 重装被删除或替换，而用量历史要比它们活得久。
+所以 `$DSH_HOME` 只影响 Harness 自己的东西，**不再影响账本落在哪**；profile 的配置也搬不动它。
+
+旧账本继承（`loadLedgerWithInheritance()`）：首次加载时把 1.5.0 及更早的位置合并进来。旧位置是
+`$DSH_HOME/usage-ledger/ledger.json` 与 `~/.dsh/usage-ledger/ledger.json`（`DSH_HOME` 未设置时两者是同一个文件；
+设成别处时两个 home 都看）；候选路径按解析后的绝对路径去重（Windows 上再折叠大小写），并排除新位置自己：
+
+- 按会话取 `offset` 更大的那一行（它包含另一行的全部事件），`createdAt` 取更早的，其余沿用 §6 的合并规则；
+- 合并后写盘一次，旧文件**原样留在原处**：不移动、不删除、不截断——本机可能还装着旧版 Harness 在写它；
+- 新位置旁边的 `imported.json` 记住每个旧文件的 `size` + `mtime` + 导入时刻，所以同一个版本只导入一次；
+  旧文件以后又被旧版 Harness 推进（大小或 mtime 变了）才会再次合并；
+- 删掉 `ledger.json` 与 `ledger.json.bak` 是「清零」，`imported.json` 不删，旧历史因此不会重新长回来；
+  确实要从旧账本重导一次时才连它一起删。
+
+`imported.json` 的形状（键是旧账本的绝对路径，Windows 上按小写折叠；坏记录按「没有记录」处理，等价于重新导入，这一步幂等）：
+
+```jsonc
+{
+  "version": 1,
+  "sources": {
+    "<旧账本绝对路径>": { "size": 102400, "mtimeMs": 1792859000000, "at": 1792859100000 }
+  }
+}
+```
+
 ## 4. 每轮同步算法
 
 ```text
@@ -138,7 +190,8 @@ sync():
     days = fold(page.events, prev.days)          // 累加进该会话已有贡献
     prev.offset += page.events.length; prev.lastSeq = ...; prev.revision/sizeBytes = ...
   for [id,row] of sessions:                      // 磁盘上没了
-    if !live.has(id) && row.goneAt === null: row.goneAt = now   // 只打标记，不扣减
+    if !live.has(id) && row.goneAt === null:
+        row.goneAt = now; row.lastSeenAt = now     // 只打标记、不扣减；lastSeenAt 让合并写保留标记
   persist()                                      // 原子写 + .bak
 ```
 
@@ -175,19 +228,27 @@ sync():
 - id: usage-panel
   config:
     syncIntervalMs: 600000     # 后台记录间隔，下限 60000
-    ledgerPath: ''             # 空 = <DSH_HOME>/usage-ledger/ledger.json
 ```
+
+账本位置**不是配置项**：`$DSH_USAGE_LEDGER`（完整文件路径）是唯一的覆盖方式，只在测试或确实要指向别处时当逃生门用；
+profile 的配置改不动它，`$DSH_HOME` 也不行（§3.1）。
 
 ## 6. 写盘与多实例
 
-- **原子写**：`ledger.json.tmp` → `rename`；写前把旧文件复制成 `.bak`。中途崩溃最多丢一轮同步，不会写坏。
+- **原子写**：`ledger.json.tmp` → `rename`；写前把旧文件复制成 `.bak`（旧主文件损坏时保留上一份可解析的 `.bak`；从 `.bak` 恢复后再次写盘不会把坏文件拷成备份）。中途崩溃最多丢一轮同步，不会写坏。
 - **合并写的平局规则**：两行 `offset` 相同时，「谁读得更多」分不出高下，此时必须取 `lastSeenAt` 更新的那一行
   （连同它的 `revision` / `sizeBytes` / `goneAt`）。若平局时留下磁盘上的旧行，刚同步好的 `revision` 会被丢掉，
   下一轮又看到「变了」，于是每一轮都重读一遍刚刚读完的日志——实测就是这么把 2 ms 空闲 tick 变成 2.7 s 全量扫描的。
   自检里为此留了断言（`ledger: a tie keeps the fresher revision`）。
 - **合并写**（两个 DSH 窗口同时跑时）：写盘前重新读一次磁盘上的文件，按会话 id 合并：
-  同一 id 取 `offset` 更大的那行（它包含更早那行的全部事件），`goneAt` 取「先发生的非空值」，`createdAt` 取更早的。
+  同一 id 取 `offset` 更大的那行（它包含更早那行的全部事件）；`offset` 相同时取 `lastSeenAt` 更新的一行，
+  它的 `revision` / `sizeBytes` / `goneAt` 随之一并取胜（§6 的平局规则），`createdAt` 取更早的。
   这样「后写的覆盖先写的」不会造成同一个事件被记两次（offset 是绝对位置，回退才会重复计）。
+  标记「已删除」时同样更新 `lastSeenAt`：否则平局会让磁盘上 `goneAt: null` 的旧行赢回来，标记永远写不进盘
+  （1.6.0 修复，自检里留了 `ledger store: a gone mark survives the merge-on-save`）。
+- **继承先于同步**：`loadLedgerWithInheritance()` 在第一次同步之前把旧位置的账本并进来并写盘一次
+  （`imported.json` 用 `tmp + rename` 单独写）。旧行带着它记下的 `offset`，少了这一步，
+  第一次同步会把旧安装已经折叠过的日志再记一遍。
 - 别用文件锁：个人自用，合并写比锁简单，且失败模式温和（最多丢一轮增量，下一轮自然补上）。
 
 ## 7. 面板（`client.js`）改动
@@ -196,6 +257,8 @@ sync():
 - 顶部统计条下面加一行说明（新增 i18n 键）：
   `账本自 09-24 起 · 更新于 10-25 22:18 · 本机现存日志 <现存合计>（<N> 个会话）· 已删除 <M> 个会话，其用量仍计入累计`
   ——「现存」是老的现场折叠数，用来解释「账本 > 现存」这种情形（删过会话）。
+- 1.6.0 起，说明行的浮层（`title`）改成「说明文案 + 账本文件路径」两行（路径取 `scan.ledgerPath`，为空时只显示文案），
+  文案写明卸载插件或重装 DSH 都不会删除账本——这是用户唯一能在面板上核对「该备份哪个文件」的地方；文案仍走 i18n，中英同步。
 - 建账中的状态：`首次建账中，当前显示本机现存日志。`（首屏不等建账，2–3 s 后自动换上账本数）。
 - 告警（`warnings`）照现有 `note` 行的样式展示，最多 3 条。
 
@@ -208,7 +271,10 @@ sync():
 | 会话被迁移/重写（DSH 格式升级） | 该会话后续增量可能漏记 | 宁少记不倒退；面板 `warnings` 里可见 |
 | 日志被外部截断 | 同上 | —— |
 | 两个 DSH 实例同时跑 | 合并写，最多丢一轮 | 见 §6 |
-| 账本文件损坏 | 启动时读 `.bak`；都坏则重新建账（累计从当下重来） | 建账前先备份账本，值得写进 README |
+| 账本文件损坏 | 启动时读 `.bak`；都坏则重新建账（累计从当下重来） | 建账前先备份账本；旧位置的账本仍在时，删 `imported.json` 可让它重新导入 |
+| 卸载插件 / 卸载或重装 DSH | 账本不动，下一次安装接着记 | 账本在每用户数据目录，不在插件目录也不在 DSH home |
+| 1.5.0 及更早的旧账本 | 首次加载合并进来，旧文件原样留在原处 | `imported.json` 记 size + mtime，一个版本只导入一次 |
+| 换了 `DSH_HOME` / 新开一个 home | 账本不变 | 新 home 只带来新会话：旧行继续计入（标 `gone`），新会话照常加入 |
 | 磁盘很小 | 账本 1 MB/2000 会话 | —— |
 
 ## 8.5 为什么是一个 JSON 文件，而不是 SQLite / 宿主的 storage
@@ -223,12 +289,25 @@ sync():
 | 文件 | 改动 |
 |---|---|
 | `lib/ledger.js`（新增，纯逻辑，无 IO 副作用） | `foldEvents` / `addUsage` / `mergeDays` / `applySnapshot` / `mergeLedgerFiles`，全部纯函数，`__internals` 暴露给测试 |
-| `lib/ledger-store.js`（新增） | 读写 + 原子写 + `.bak` + 合并写；路径解析（`DSH_HOME` / `DSH_USAGE_LEDGER`） |
+| `lib/ledger.js` 的存储层（计划里单独的 `lib/ledger-store.js`，最终并进同一模块） | 读写 + 原子写 + `.bak` + 合并写；当时的账本路径是 `<DSH_HOME>/usage-ledger/ledger.json`（1.6.0 起改为每用户数据目录，见 §3.1） |
 | `index.js` | 注入 `sessionPersistence`（已有）；新 `syncLedger(ctx)` + 单飞；`usageReport()` 改回账本，附 `live` 现场折叠；`apply()` 里加定时器与 dispose 写盘；`usage` 路由保留 15 s TTL |
 | `client.js` | §7 的数据源与说明行；i18n（zh/en 同步加键） |
 | `package.json` | 版本 1.4.0 → **1.5.0**（新增数据口径 = minor）；`files` 加 `lib/ledger.js`、`tools/seed-ledger.mjs`、`docs/*.md`；`exports` 加 `./ledger`；`scripts.ledger` |
 | `test/selfcheck.mjs` | 假 persistence 的账本场景（见 §10），断言「只加不减」 |
 | `README.md` / `README.en.md` | 「它显示什么」表格加一行「累计来自本机账本，删会话不会降低」 |
+
+1.6.0（存储位置迁址）的落点：
+
+| 文件 | 改动 |
+|---|---|
+| `lib/ledger.js` | `resolveDataRoot` / `resolveLedgerPath`（每用户数据目录，忽略 `DSH_HOME`）、`resolveLegacyLedgerPaths`、`resolveImportRecordPath`、`loadLedgerWithInheritance`、`imported.json` 读写；另修 `goneAt` 落盘（标记时同步 `lastSeenAt`） |
+| `index.js` | 首次加载走 `loadLedgerWithInheritance`；响应里带 `scan.ledgerPath` |
+| `client.js` | 说明行的浮层显示账本路径与「卸载 / 重装不丢」的说明 |
+| `tools/seed-ledger.mjs` | 与面板同一个缺省路径；同样继承旧账本；`--dry-run` 时 `write: false` |
+| `package.json` | 1.5.0 → **1.6.0** |
+| `cordis.patch.yml` | 注释改写：账本在每用户数据目录，`DSH_HOME` 不影响它 |
+| `README.md` / `README.en.md` | 存储位置、继承、清零语义 |
+| `test/selfcheck.mjs` | 存储位置与继承的断言（§10） |
 
 保持既有硬约束：无构建步骤、Host 半只读本地事实、HTTP 200 + `ok` 判别式、数字不缩写、文案走 i18n。
 
@@ -242,7 +321,7 @@ sync():
 
 ## 10. 验证
 
-自检（`node test/selfcheck.mjs`）用假的 persistence 覆盖 10 个场景（A2 节共 25 条 `ledger:` 断言），断言全部是「数字与不变量」而不是实现细节：
+自检（`node test/selfcheck.mjs`）用假的 persistence 覆盖 10 个场景，A2 节集中了账本断言（全套 180+ 条，含 1.6.0 新增的存储位置、旧账本继承与重装存活），断言全部是「数字与不变量」而不是实现细节：
 
 1. 新会话 → 计入一次；再同步一次 → 计入次数不变（幂等）。
 2. 未变化 → `read` 调用数为 0。
@@ -254,6 +333,9 @@ sync():
 8. 两个账本文件合并 → 无重复计费、无丢失。
 9. 同一会话换成另一种 id 拼写出现 → 行改名、用量不变、`adopted` 加一、`gone` 为 0。
 10. 两份账本各记一种拼写，合并后只剩一行、用量只算一次（否则磁盘上的旧键会在每次写盘时被补回来）。
+
+1.6.0 追加（同一节）：三个平台的缺省路径、`DSH_USAGE_LEDGER` 覆盖、`DSH_HOME` 不再影响落点、旧账本只导入一次、
+清零后旧历史不复活，以及模拟卸载插件 + 重装 DSH 后累计不变。
 
 真机（改完必做）：
 
@@ -278,7 +360,7 @@ sync():
 
 ## 12. 与「不恢复会话」的关系
 
-本方案完全不碰会话文件：不复制、不留副本、不重建索引，只在 `~/.dsh/usage-ledger/` 下维护自己的账本。
+本方案完全不碰会话文件：不复制、不留副本、不重建索引，只在每用户数据目录的 `dsh-usage/` 下维护自己的账本（§3.1）。
 会话日志是**输入**，账本是**输出**；日志删了，输出仍在。
 
 ## 13. 附录：参考实现（可直接搬进 `lib/ledger.js`）

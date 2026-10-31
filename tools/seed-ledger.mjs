@@ -22,6 +22,10 @@
  * \`--backfill\` only ever ADDS rows: an id already in the ledger is left exactly
  * as the Host left it, so running it twice changes nothing.
  *
+ * The ledger defaults to the per-user data directory (the file the plugin owns and
+ * uninstalling the plugin or the Harness cannot delete); a pre-1.6 ledger under
+ * the Harness home is inherited on the way in.
+ *
  * The reader understands the current on-disk shape (zstd-compressed JSONL, one
  * zstd frame per append, plus plain JSONL). It exists because the Host service
  * that normally reads these logs (\`sessionPersistence\`) is not reachable from a
@@ -39,7 +43,7 @@ import {
   emptyLedger,
   foldEventsInto,
   ledgerView,
-  loadLedgerFile,
+  loadLedgerWithInheritance,
   resolveLedgerPath,
   saveLedgerMerged,
   syncLedger,
@@ -252,7 +256,9 @@ export function defaultSessionsRoot(env = process.env) {
  * @returns {Promise<{ added: number, skipped: number, tokens: number, before: number, after: number, ledger: any }>}
  */
 export async function backfill(options) {
-  const onDisk = loadLedgerFile(options.ledgerPath).ledger
+  // The same first-load inheritance the Host does: a backfill run before the
+  // Host's first sync must start from the inherited rows, not from an empty file.
+  const onDisk = loadLedgerWithInheritance(options.ledgerPath, { write: !options.dryRun }).ledger
   const ledger = structuredClone(onDisk)
   const before = ledgerView(ledger).totals.total
   const persistence = directoryPersistence(options.root)
@@ -332,7 +338,7 @@ async function main() {
     return
   }
 
-  const loaded = loadLedgerFile(ledgerPath)
+  const loaded = loadLedgerWithInheritance(ledgerPath, { write: !dryRun })
   const ledger = loaded.ledger
   const before = ledgerView(ledger)
   const persistence = directoryPersistence(root)
@@ -342,6 +348,9 @@ async function main() {
   // in-memory view alone can be a couple of rows — and their whole credit — larger
   // than what the panel will read.
   const after = dryRun ? ledgerView(ledger) : ledgerView(saveLedgerMerged(ledgerPath, ledger))
+  if (loaded.imported.length > 0) {
+    console.log('inherited: ' + String(loaded.imported.length) + ' old ledger(s) merged from ' + loaded.imported.join(', '))
+  }
   console.log('\nfolded   : ' + String(result.read) + ' read, ' + String(result.skipped) + ' unchanged, ' + String(result.gone) + ' gone')
   if (result.adopted > 0) console.log('adopted  : ' + String(result.adopted) + ' row(s) filed under the other id spelling')
   console.log('took     : ' + String(result.tookMs) + ' ms')

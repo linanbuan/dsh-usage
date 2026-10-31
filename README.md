@@ -45,7 +45,7 @@ dsh plugin --profile <你的 profile> add <本目录的绝对路径>
 | 区块 | 内容 |
 |---|---|
 | 概览条 | 当日用量、当日缓存命中、累计用量、累计缓存命中（附缓存占提示词的百分比）、峰值单日、连续使用天数与最长记录；下面一行写明账本自何时起累计、上次更新于何时、以及 `本机现存日志` 折算出的数字 |
-| 累计的来历 | 累计与热力图来自本机账本（见下一节）：会话被删除后不再被读取，但它已经记下的用量不会从累计里消失 |
+| 累计的来历 | 累计与热力图来自本机账本（见下一节）：账本在每用户的数据目录里，卸载插件或重装 DSH 都带不走；会话被删除后不再被读取，但已记下的用量不会从累计里消失 |
 | 历史用量 | 近六个月的热力图：一格一天，切到 **每周** 后一格一周；颜色越深用量越多，把指针（或用键盘聚焦）放到格子上浮出那一天或那一周的用量与缓存命中；点一格在下方看完整明细，左右按钮翻十二个月 |
 | API 额度 | `kimi-coding`（五小时窗口、总额度）、`commandcode`（五小时、每周、总额度）与 `opencode-go`（滚动五小时、每周、总额度）的已用比例与刷新时间 |
 
@@ -63,12 +63,32 @@ dsh plugin --profile <你的 profile> add <本目录的绝对路径>
 
 ## 累计用量与账本
 
-累计数字不是「把现在磁盘上的会话日志加一遍」，而是记在一份本机账本里：
+累计数字不是「把现在磁盘上的会话日志加一遍」，而是记在一份本机账本里。账本放在**每用户的操作系统数据目录**，
+刻意不放在插件目录，也不放在 DSH 的 home 里——这两处都可能随卸载 / 重装动作被删除或替换，而用量历史要比它们活得久：
 
 ```text
-<DSH_HOME>/usage-ledger/ledger.json       # 缺省即 ~/.dsh/usage-ledger/ledger.json
-<DSH_HOME>/usage-ledger/ledger.json.bak   # 上一次成功写盘的副本
+Windows   %LOCALAPPDATA%\dsh-usage\ledger.json      # 未设置时回落 %APPDATA%，再回落 %USERPROFILE%\AppData\Local
+macOS     ~/Library/Application Support/dsh-usage/ledger.json
+Linux     $XDG_DATA_HOME/dsh-usage/ledger.json      # 缺省 ~/.local/share/dsh-usage/ledger.json
 ```
+
+同目录还有两个文件：
+
+```text
+ledger.json.bak   上一次成功写盘的副本
+imported.json     旧账本的导入记录（每个旧文件的 size + mtime）
+```
+
+`DSH_USAGE_LEDGER` 仍可覆盖账本位置，给的是**完整文件路径**；`DSH_HOME` 不再影响账本落在哪，profile 的配置也搬不动它。
+
+**卸载不会带走这份账本。** 移除 bundle、卸载或重装 DSH 都不会自动删除这个目录，所以下一次安装读到的是同一份文件、
+接着往下记：重装 DSH 会开一个新的 home 与一批新会话，旧会话的行标成「已删除」继续计入累计，新会话照常加入，
+累计只增不减。
+
+从 1.5.0 及更早的版本升级时，旧位置的账本会被**合并**进来，原文件不移动也不删除。旧位置是
+`$DSH_HOME/usage-ledger/ledger.json` 与 `~/.dsh/usage-ledger/ledger.json`（`DSH_HOME` 未设置时两者是同一个文件，
+设成别处时两个 home 都看）；合并按会话取「读得更多」的那一行、起始时间取更早的，`imported.json` 记住每个旧文件的
+大小与修改时间，所以同一个版本只导入一次——旧文件以后又被旧版 Harness 推进了，下一轮才会再次合并。
 
 账本按会话一行，记住它贡献过的每日用量，以及日志读到了第几条。于是：
 
@@ -81,9 +101,11 @@ dsh plugin --profile <你的 profile> add <本目录的绝对路径>
   账本按目录名原文记键，遇到「同一会话、另一种拼写」时把那行*改名*（用量保留），写盘合并时再把成对的拼写折成一行。
 
 概览条下面那行 `本机现存日志 …` 就是同一批数据里「日志还在磁盘上」的那部分。累计比它多出来的，
-正好是已经删掉、但账本仍然记着的那些会话——这就是这两个数字的差该怎么读。
+正好是已经删掉、但账本仍然记着的那些会话——这就是这两个数字的差该怎么读。把指针停在那行上，
+浮层会写出账本文件的完整路径，并说明卸载插件或重装 DSH 都不会丢。
 
-想把账本清零（累计从当下重来），删掉 `ledger.json` 与 `ledger.json.bak` 即可。
+想把账本清零（累计从当下重来），删掉 `ledger.json` 与 `ledger.json.bak` 即可：`imported.json` 会拦住旧账本，
+升级前的历史不会因为删了新文件而重新长回来。确实要从旧账本再导入一次，才需要连 `imported.json` 一起删掉。
 
 ### 补齐旧账本 / 从备份补记
 
@@ -93,6 +115,8 @@ dsh plugin --profile <你的 profile> add <本目录的绝对路径>
 node tools/seed-ledger.mjs                      # 用本机会话日志建账 / 推进（Host 不在时）
 node tools/seed-ledger.mjs --backfill --from <备份的 sessions 目录>
 ```
+
+它用的也是上面那个缺省路径，并同样会把旧位置的账本继承进来。
 
 `--backfill` **只加不改**：备份里有、账本里没有的会话会作为「已消失」的行补进来（不复制、不恢复任何会话文件），
 已经在账本里的会话原样不动，所以重复执行没有副作用。想先看结果就加 `--dry-run`。
@@ -136,8 +160,8 @@ package.json       bundle 清单（dsh.bundle.patch + dsh.client）
 cordis.patch.yml   一行 insert：装载 Host 半
 index.js           Host 半：/api/usage/usage、/api/usage/quota、/api/usage/report
 client.js          浏览器半：settings.section 页面（无构建步骤的懒 CJS bundle）
-lib/ledger.js      增量账本：折叠、同步、合并、读写（纯逻辑 + 原子写）
-tools/seed-ledger.mjs  在没有 Harness 时建账 / 从备份补记
+lib/ledger.js      增量账本：折叠、同步、合并、原子读写；账本路径与旧账本继承
+tools/seed-ledger.mjs  在没有 Harness 时建账 / 从备份补记（同一个缺省路径）
 icon.svg           bundle 图标
 locale/*.json      插件清单里的标题与说明
 docs/              面板截图（由 test/preview.mjs 的静态渲染产出）、账本方案与项目日志
@@ -166,6 +190,8 @@ node test/selfcheck.mjs      # 或 pnpm test
 以及 section 的 id / order / label / 组件类型。账本单独一节断言「只增不减」的全部不变量：
 建账与全量折叠相等、未变化的会话一次都不打开、增长只记一次、删除后累计不变、恢复回来只记新增、
 变短与重排只告警不回退、两份账本合并取「读得更多」的一行、损坏文件回落到 `.bak`，以及概览条那行账本说明的文案。
+1.6.0 起另加存储位置与继承的断言：三个平台的缺省路径、`DSH_USAGE_LEDGER` 覆盖、`DSH_HOME` 不再影响落点、
+旧位置的账本只导入一次、删账本不会让旧历史复活，以及卸载插件 + 重装 DSH 后累计不变。
 浏览器半另外断言热力图的窗口、周列、ISO 周、分档、周聚合、连续天数，和渲染树里的格子数、
 `aria-label`、图例与分段开关。全部通过即退出码 0。
 

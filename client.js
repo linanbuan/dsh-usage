@@ -103,7 +103,7 @@ window.__ModuleLoader__.load({
         ledgerUpdated: '更新于 {at}',
         ledgerLive: '本机现存日志 {total}（{sessions} 个会话）',
         ledgerGone: '已删除 {n} 个会话，其用量仍计入累计',
-        ledgerNote: '累计来自本机账本：会话被删除后不再重读，但已记的用量不会回退。',
+        ledgerNote: '累计来自本机账本：账本存在用户数据目录，卸载插件或重装 DSH 都不会删除；会话被删除后不再重读，但已记的用量不会回退。',
         weekdays: '一二三四五六日',
         todayBadge: '今天',
       },
@@ -173,7 +173,7 @@ window.__ModuleLoader__.load({
         ledgerUpdated: 'updated {at}',
         ledgerLive: 'on disk now: {total} ({sessions} sessions)',
         ledgerGone: '{n} deleted sessions still count',
-        ledgerNote: 'All-time figures come from this machine’s ledger: a deleted session is no longer read, but the usage it contributed never drops back out.',
+        ledgerNote: 'All-time figures come from a ledger in the per-user data directory: uninstalling the plugin or DSH does not remove it. A deleted session is no longer read, but the usage it contributed never drops back out.',
         weekdays: 'MTWTFSS',
         todayBadge: 'today',
       },
@@ -915,9 +915,15 @@ window.__ModuleLoader__.load({
         parts.push(trf('ledgerLive', { total: plain(live.total), sessions: plain(live.sessions) }))
       }
       if ((scan.gone ?? 0) > 0) parts.push(trn('ledgerGone', plain(scan.gone)))
+      // The path rides in the tooltip: it is the file a user has to back up, and
+      // naming it is what makes "this survives an uninstall" checkable.
+      const path = typeof scan.ledgerPath === 'string' && scan.ledgerPath !== '' ? scan.ledgerPath : undefined
       return h(
         'p',
-        { className: 'dsu-hint dsu-stripLedger', title: tr('ledgerNote') },
+        {
+          className: 'dsu-hint dsu-stripLedger',
+          title: path === undefined ? tr('ledgerNote') : `${tr('ledgerNote')}\n${path}`,
+        },
         parts.join(' · '),
       )
     }

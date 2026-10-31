@@ -30,6 +30,12 @@
  * and its log position, so a session that is deleted stops being read but never
  * stops being counted. A log that merely grew costs one tail read.
  *
+ * That ledger lives in the per-user data directory, not under `$DSH_HOME` and not
+ * beside the plugin: uninstalling the plugin or the Harness must not delete the
+ * usage history, and the next install has to inherit it. A 1.5.x ledger left in
+ * `$DSH_HOME/usage-ledger` is merged once on load (see
+ * `loadLedgerWithInheritance`) and left in place.
+ *
  * @module @local/dsh-usage
  */
 
@@ -37,7 +43,7 @@ import {
   emptyBucket,
   emptyLedger,
   ledgerView,
-  loadLedgerFile,
+  loadLedgerWithInheritance,
   localDateKey,
   resolveLedgerPath,
   saveLedgerMerged,
@@ -207,7 +213,11 @@ function ensureLedgerSynced(persistence) {
   const run = (async () => {
     if (ledgerRuntime.path === undefined) ledgerRuntime.path = resolveLedgerPath()
     if (ledgerRuntime.ledger === undefined) {
-      const loaded = loadLedgerFile(ledgerRuntime.path)
+      // First load of this process: pick up the ledger this install inherits.
+      // Worth doing synchronously before the first sync, because the imported
+      // rows also carry each session's consumed offset — syncing without them
+      // would re-read (and re-credit) logs the old install had already folded.
+      const loaded = loadLedgerWithInheritance(ledgerRuntime.path)
       ledgerRuntime.ledger = loaded.ledger
       ledgerRuntime.warnings = loaded.warnings.slice()
     }
@@ -275,6 +285,7 @@ function ledgerReport() {
       lastDay: view.days.length > 0 ? view.days[view.days.length - 1].date : undefined,
       warnings: ledgerRuntime.warnings.slice(),
       source: 'ledger',
+      ledgerPath: ledgerRuntime.path,
       since: ledger.createdAt,
       updatedAt: ledger.updatedAt,
       live: view.live,

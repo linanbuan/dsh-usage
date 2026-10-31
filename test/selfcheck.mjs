@@ -16,6 +16,15 @@ const BUNDLE = dirname(dirname(fileURLToPath(import.meta.url)));
 // is ever loaded.
 const LEDGER_DIR = join(tmpdir(), `dsh-usage-selfcheck-${String(process.pid)}`);
 rmSync(LEDGER_DIR, { recursive: true, force: true });
+// The host's first load inherits pre-1.6 ledgers from $DSH_HOME and ~/.dsh, so
+// every home this process can resolve is pointed at the throwaway directory
+// first: a self-check must never read the operator's real usage history.
+process.env.DSH_HOME = join(LEDGER_DIR, 'dsh-home');
+process.env.HOME = join(LEDGER_DIR, 'home');
+process.env.USERPROFILE = process.env.HOME;
+process.env.APPDATA = join(LEDGER_DIR, 'appdata');
+process.env.LOCALAPPDATA = join(LEDGER_DIR, 'localappdata');
+process.env.XDG_DATA_HOME = join(LEDGER_DIR, 'xdg');
 process.env.DSH_USAGE_LEDGER = join(LEDGER_DIR, 'ledger.json');
 void join;
 let failures = 0;
@@ -239,6 +248,18 @@ check(
   localElapsed < DELAY_MS,
   `${String(localElapsed)}ms`,
 );
+// The panel's caption names the file to back up, so the payload has to carry the
+// path the ledger was actually read from — which 1.6.0 moved out of $DSH_HOME.
+check(
+  'ledger: the usage payload names the ledger file it reads',
+  localPayload.usage?.scan?.source === 'ledger' &&
+    typeof localPayload.usage?.scan?.ledgerPath === 'string' &&
+    localPayload.usage.scan.ledgerPath === process.env.DSH_USAGE_LEDGER,
+  JSON.stringify({
+    source: localPayload.usage?.scan?.source,
+    ledgerPath: localPayload.usage?.scan?.ledgerPath,
+  }),
+);
 
 // A cached quota answer is served as-is with `refreshing:false`.
 const cachedResponse = await quotaRoute.fetch(new Request('http://127.0.0.1/api/usage/quota'));
@@ -410,12 +431,16 @@ console.log('\nA2. incremental ledger');
 
 const ledgerModule = await import(pathToFileURL(`${BUNDLE}/lib/ledger.js`).href);
 const {
+  emptyBucket,
   emptyLedger,
   ledgerView,
   loadLedgerFile,
+  loadLedgerWithInheritance,
   localDateKey,
   mergeLedgers,
   normalizeLedger,
+  resolveImportRecordPath,
+  resolveLegacyLedgerPaths,
   resolveLedgerPath,
   saveLedgerFile,
   saveLedgerMerged,
@@ -639,10 +664,351 @@ check(
   normalizeLedger({ sessions: { x: { offset: 'nonsense', days: { bad: null } } } }).sessions.x.offset === 0,
 );
 check('ledger: a non-object document becomes an empty ledger', Object.keys(normalizeLedger(null).sessions).length === 0);
+
+// ---------------------------------------------------------------------------
+// Storage location: 1.6.0 moved the ledger into the per-user data directory,
+// out of $DSH_HOME and out of the plugin directory — the two things an
+// uninstall removes. Path expectations are built with join() so the separators
+// match whichever platform runs this check.
+// ---------------------------------------------------------------------------
+const fixtureHome = join('fixtures', 'home');
+const fixtureWinHome = join('fixtures', 'win-home');
+const fixtureLocalAppData = join('fixtures', 'localappdata');
+const fixtureRoaming = join('fixtures', 'appdata');
+const fixtureXdg = join('fixtures', 'xdg');
+const fixtureOverride = join('fixtures', 'override', 'ledger.json');
+const fixtureDshHome = join('fixtures', 'dsh');
+
+const winLocal = resolveLedgerPath({ LOCALAPPDATA: fixtureLocalAppData }, fixtureWinHome, 'win32');
 check(
-  'ledger: the path honours DSH_USAGE_LEDGER over DSH_HOME',
-  resolveLedgerPath({ DSH_USAGE_LEDGER: 'C:/tmp/a.json', DSH_HOME: 'C:/home' }, 'C:/users/x') === 'C:/tmp/a.json' &&
-    resolveLedgerPath({ DSH_HOME: 'C:/home' }, 'C:/users/x').includes('usage-ledger'),
+  'ledger: win32 keeps the ledger under LOCALAPPDATA',
+  winLocal === join(fixtureLocalAppData, 'dsh-usage', 'ledger.json'),
+  winLocal,
+);
+const winRoaming = resolveLedgerPath({ APPDATA: fixtureRoaming }, fixtureWinHome, 'win32');
+check(
+  'ledger: win32 falls back to APPDATA',
+  winRoaming === join(fixtureRoaming, 'dsh-usage', 'ledger.json'),
+  winRoaming,
+);
+const winHomeOnly = resolveLedgerPath({}, fixtureWinHome, 'win32');
+check(
+  'ledger: win32 falls back to <home>/AppData/Local',
+  winHomeOnly === join(fixtureWinHome, 'AppData', 'Local', 'dsh-usage', 'ledger.json'),
+  winHomeOnly,
+);
+const macDefault = resolveLedgerPath({}, fixtureHome, 'darwin');
+check(
+  'ledger: darwin uses Application Support',
+  macDefault === join(fixtureHome, 'Library', 'Application Support', 'dsh-usage', 'ledger.json'),
+  macDefault,
+);
+const linuxXdg = resolveLedgerPath({ XDG_DATA_HOME: fixtureXdg }, fixtureHome, 'linux');
+check('ledger: linux honours XDG_DATA_HOME', linuxXdg === join(fixtureXdg, 'dsh-usage', 'ledger.json'), linuxXdg);
+const linuxDefault = resolveLedgerPath({}, fixtureHome, 'linux');
+check(
+  'ledger: linux defaults to ~/.local/share',
+  linuxDefault === join(fixtureHome, '.local', 'share', 'dsh-usage', 'ledger.json'),
+  linuxDefault,
+);
+const overrideBoth = [
+  resolveLedgerPath(
+    { DSH_USAGE_LEDGER: fixtureOverride, DSH_HOME: fixtureDshHome, LOCALAPPDATA: fixtureLocalAppData },
+    fixtureWinHome,
+    'win32',
+  ),
+  resolveLedgerPath(
+    { DSH_USAGE_LEDGER: fixtureOverride, DSH_HOME: fixtureDshHome, XDG_DATA_HOME: fixtureXdg },
+    fixtureHome,
+    'linux',
+  ),
+];
+check(
+  'ledger: DSH_USAGE_LEDGER wins verbatim over every home and data root',
+  overrideBoth.every((path) => path === fixtureOverride),
+  JSON.stringify(overrideBoth),
+);
+const homeIgnored = [
+  resolveLedgerPath({ DSH_HOME: fixtureDshHome }, fixtureWinHome, 'win32'),
+  resolveLedgerPath({ DSH_HOME: fixtureDshHome }, fixtureHome, 'linux'),
+];
+check(
+  'ledger: DSH_HOME no longer moves the ledger',
+  homeIgnored[0] === winHomeOnly && homeIgnored[1] === linuxDefault,
+  JSON.stringify(homeIgnored),
+);
+
+// The pre-1.6 ledgers are read where they were filed: $DSH_HOME/usage-ledger and
+// ~/.dsh/usage-ledger. A home that moved leaves both worth looking at, and the
+// canonical path must never be listed as a source of itself.
+const legacyHome = join('fixtures', 'legacy-home');
+const legacyDshHome = join('fixtures', 'legacy-dsh');
+const legacyFileInDsh = join(legacyDshHome, 'usage-ledger', 'ledger.json');
+const legacyFileInHome = join(legacyHome, '.dsh', 'usage-ledger', 'ledger.json');
+const bothLegacy = resolveLegacyLedgerPaths({ DSH_HOME: legacyDshHome }, legacyHome, 'linux', linuxDefault);
+check(
+  'ledger: both pre-1.6 homes are searched when $DSH_HOME moved',
+  bothLegacy.length === 2 && bothLegacy[0] === legacyFileInDsh && bothLegacy[1] === legacyFileInHome,
+  JSON.stringify(bothLegacy),
+);
+const dedupedLegacy = resolveLegacyLedgerPaths({ DSH_HOME: join(legacyHome, '.dsh') }, legacyHome, 'linux', linuxDefault);
+const defaultLegacy = resolveLegacyLedgerPaths({}, legacyHome, 'linux', linuxDefault);
+check(
+  'ledger: a $DSH_HOME that is already ~/.dsh is searched once',
+  dedupedLegacy.length === 1 &&
+    dedupedLegacy[0] === legacyFileInHome &&
+    defaultLegacy.length === 1 &&
+    defaultLegacy[0] === legacyFileInHome,
+  JSON.stringify({ dedupedLegacy, defaultLegacy }),
+);
+const canonicalAsLegacy = resolveLegacyLedgerPaths({ DSH_HOME: legacyDshHome }, legacyHome, 'linux', legacyFileInDsh);
+check(
+  'ledger: the canonical path is never listed as a legacy source',
+  canonicalAsLegacy.length === 1 && canonicalAsLegacy[0] === legacyFileInHome && !bothLegacy.includes(linuxDefault),
+  JSON.stringify({ canonicalAsLegacy, bothLegacy }),
+);
+
+// ---------------------------------------------------------------------------
+// Inheritance from the pre-1.6 locations, on explicit temp paths so no real home
+// is ever read. The record beside the new ledger is what makes each old file
+// merge once rather than on every boot — and what makes an intentional reset
+// stick.
+// ---------------------------------------------------------------------------
+const inheritRoot = join(LEDGER_DIR, 'inherit');
+const inheritHome = join(inheritRoot, 'home');
+const legacyLedgerPath = join(inheritHome, '.dsh', 'usage-ledger', 'ledger.json');
+const canonicalLedgerPath = join(inheritRoot, 'localappdata', 'dsh-usage', 'ledger.json');
+const importRecordPath = resolveImportRecordPath(canonicalLedgerPath);
+const ledgerFs = await import('node:fs');
+
+/** One stored (JSON) day bucket: enough shape for ledgerView to fold it. */
+const fixtureDay = (date, total) => {
+  const bucket = emptyBucket(date);
+  bucket.input = total;
+  bucket.total = total;
+  bucket.requests = 1;
+  return bucket;
+};
+/** A ledger document holding one row per id, as a 1.5.x install left it. */
+const fixtureLedger = (rows) => {
+  const document = emptyLedger();
+  document.createdAt = 111;
+  document.updatedAt = 222;
+  for (const [id, spec] of Object.entries(rows)) {
+    document.sessions[id] = {
+      project: 'fixtures',
+      offset: spec.offset ?? 1,
+      lastSeq: 0,
+      revision: 'r1',
+      sizeBytes: 100,
+      firstSeenAt: 1,
+      lastSeenAt: 2,
+      goneAt: null,
+      days: spec.days,
+    };
+  }
+  return document;
+};
+const legacyOptions = { legacyPaths: [legacyLedgerPath] };
+
+ledgerFs.mkdirSync(dirname(legacyLedgerPath), { recursive: true });
+ledgerFs.writeFileSync(
+  legacyLedgerPath,
+  JSON.stringify(fixtureLedger({ 'session-old': { days: { '2026-10-01': fixtureDay('2026-10-01', 500) } } })),
+  'utf8',
+);
+const inherited = loadLedgerWithInheritance(canonicalLedgerPath, legacyOptions);
+check(
+  'ledger inherit: a first load merges the pre-1.6 ledger',
+  inherited.imported.length === 1 && inherited.imported[0] === legacyLedgerPath && inherited.wrote === true,
+  JSON.stringify({ imported: inherited.imported, wrote: inherited.wrote }),
+);
+check(
+  'ledger inherit: the inherited rows equal the old ledger totals',
+  ledgerView(inherited.ledger).totals.total === 500 && inherited.ledger.createdAt === 111,
+  JSON.stringify({ total: ledgerView(inherited.ledger).totals.total, createdAt: inherited.ledger.createdAt }),
+);
+check(
+  'ledger inherit: the new ledger, its import record and the old file all stay',
+  importRecordPath === join(dirname(canonicalLedgerPath), 'imported.json') &&
+    ledgerFs.existsSync(canonicalLedgerPath) &&
+    ledgerFs.existsSync(importRecordPath) &&
+    ledgerFs.existsSync(legacyLedgerPath),
+  JSON.stringify({
+    canonical: ledgerFs.existsSync(canonicalLedgerPath),
+    record: ledgerFs.existsSync(importRecordPath),
+    legacy: ledgerFs.existsSync(legacyLedgerPath),
+  }),
+);
+const inheritedAgain = loadLedgerWithInheritance(canonicalLedgerPath, legacyOptions);
+check(
+  'ledger inherit: an unchanged old ledger is skipped (fingerprint match)',
+  inheritedAgain.imported.length === 0 &&
+    inheritedAgain.wrote === false &&
+    ledgerView(inheritedAgain.ledger).totals.total === 500,
+  JSON.stringify({
+    imported: inheritedAgain.imported,
+    wrote: inheritedAgain.wrote,
+    total: ledgerView(inheritedAgain.ledger).totals.total,
+  }),
+);
+// A reset sticks: deleting the ledger and its .bak is how a user starts over, and
+// the old file must not pour its history back in.
+ledgerFs.rmSync(canonicalLedgerPath, { force: true });
+ledgerFs.rmSync(canonicalLedgerPath + '.bak', { force: true });
+const afterReset = loadLedgerWithInheritance(canonicalLedgerPath, legacyOptions);
+check(
+  'ledger inherit: a reset sticks (the record suppresses the old ledger)',
+  afterReset.imported.length === 0 &&
+    afterReset.wrote === false &&
+    ledgerView(afterReset.ledger).totals.total === 0 &&
+    !ledgerFs.existsSync(canonicalLedgerPath),
+  JSON.stringify({
+    imported: afterReset.imported,
+    wrote: afterReset.wrote,
+    total: ledgerView(afterReset.ledger).totals.total,
+  }),
+);
+ledgerFs.rmSync(importRecordPath, { force: true });
+const reimported = loadLedgerWithInheritance(canonicalLedgerPath, legacyOptions);
+check(
+  'ledger inherit: deleting the import record re-imports the old ledger',
+  reimported.imported.length === 1 && ledgerView(reimported.ledger).totals.total === 500,
+  JSON.stringify({ imported: reimported.imported, total: ledgerView(reimported.ledger).totals.total }),
+);
+// The old Harness can still be installed and advance its own ledger, so a changed
+// old file is merged again — once, on top of what the row already holds.
+const advancedLegacy = fixtureLedger({
+  'session-old': {
+    offset: 3,
+    days: { '2026-10-01': fixtureDay('2026-10-01', 700), '2026-10-02': fixtureDay('2026-10-02', 200) },
+  },
+  'session-new': { offset: 1, days: { '2026-10-03': fixtureDay('2026-10-03', 50) } },
+});
+ledgerFs.writeFileSync(legacyLedgerPath, JSON.stringify(advancedLegacy), 'utf8');
+const inheritedGrowth = loadLedgerWithInheritance(canonicalLedgerPath, legacyOptions);
+check(
+  'ledger inherit: an old ledger that was advanced later is merged again',
+  inheritedGrowth.imported.length === 1 &&
+    Object.keys(inheritedGrowth.ledger.sessions).sort().join(',') === 'session-new,session-old',
+  JSON.stringify({ imported: inheritedGrowth.imported, rows: Object.keys(inheritedGrowth.ledger.sessions) }),
+);
+check(
+  'ledger inherit: merging the advancement never double counts (500 -> 950)',
+  ledgerView(inheritedGrowth.ledger).totals.total === 950,
+  String(ledgerView(inheritedGrowth.ledger).totals.total),
+);
+// The seed tool's dry run: report what would be inherited, write nothing.
+const dryCanonical = join(inheritRoot, 'dry', 'dsh-usage', 'ledger.json');
+const dryRun = loadLedgerWithInheritance(dryCanonical, { legacyPaths: [legacyLedgerPath], write: false });
+check(
+  'ledger inherit: write:false reports the merge without writing anything',
+  dryRun.imported.length === 1 &&
+    !ledgerFs.existsSync(dryCanonical) &&
+    !ledgerFs.existsSync(resolveImportRecordPath(dryCanonical)) &&
+    ledgerView(dryRun.ledger).totals.total === 950,
+  JSON.stringify({ imported: dryRun.imported, total: ledgerView(dryRun.ledger).totals.total }),
+);
+// A damaged old file must never block the load: it is skipped with a warning and
+// retried next boot.
+const guardCanonical = join(inheritRoot, 'guarded', 'dsh-usage', 'ledger.json');
+saveLedgerFile(
+  guardCanonical,
+  fixtureLedger({ 'session-kept': { days: { '2026-10-01': fixtureDay('2026-10-01', 70) } } }),
+);
+const corruptLegacyPath = join(inheritRoot, 'corrupt-legacy.json');
+ledgerFs.writeFileSync(corruptLegacyPath, '{ not json', 'utf8');
+let corruptRead;
+let corruptThrew;
+try {
+  corruptRead = loadLedgerWithInheritance(guardCanonical, { legacyPaths: [corruptLegacyPath] });
+} catch (error) {
+  corruptThrew = error;
+}
+check(
+  'ledger inherit: a corrupt old ledger warns instead of throwing',
+  corruptThrew === undefined && (corruptRead?.warnings?.length ?? 0) > 0 && corruptRead?.imported?.length === 0,
+  corruptThrew === undefined ? JSON.stringify(corruptRead?.warnings).slice(0, 240) : corruptThrew.stack,
+);
+check(
+  'ledger inherit: a corrupt old ledger leaves the canonical ledger intact',
+  corruptRead !== undefined && ledgerView(corruptRead.ledger).totals.total === 70,
+  String(corruptRead === undefined ? 'not loaded' : ledgerView(corruptRead.ledger).totals.total),
+);
+// A damaged canonical ledger with a good .bak is a normal crash outcome; the load
+// has to recover the backup and still inherit the old rows.
+const bakCanonical = join(inheritRoot, 'bakcase', 'dsh-usage', 'ledger.json');
+const bakLegacyPath = join(inheritRoot, 'bakcase-legacy.json');
+const bakDocument = fixtureLedger({ 'session-bak': { days: { '2026-10-01': fixtureDay('2026-10-01', 70) } } });
+saveLedgerFile(bakCanonical, bakDocument);
+saveLedgerFile(bakCanonical, bakDocument);
+ledgerFs.writeFileSync(bakCanonical, '{ not json', 'utf8');
+ledgerFs.writeFileSync(
+  bakLegacyPath,
+  JSON.stringify(fixtureLedger({ 'session-late': { days: { '2026-10-02': fixtureDay('2026-10-02', 500) } } })),
+  'utf8',
+);
+const recoveredInherit = loadLedgerWithInheritance(bakCanonical, { legacyPaths: [bakLegacyPath] });
+check(
+  'ledger inherit: a corrupt ledger falls back to .bak and still inherits',
+  ledgerView(recoveredInherit.ledger).totals.total === 570 &&
+    recoveredInherit.imported.length === 1 &&
+    recoveredInherit.warnings.some((line) => line.includes('.bak')),
+  JSON.stringify({
+    total: ledgerView(recoveredInherit.ledger).totals.total,
+    imported: recoveredInherit.imported,
+    warnings: recoveredInherit.warnings,
+  }).slice(0, 300),
+);
+
+// ---------------------------------------------------------------------------
+// Reinstall survival: everything an uninstall deletes is throwaway here — the
+// Harness home and the plugin directory — and the ledger they cannot reach keeps
+// every row.
+// ---------------------------------------------------------------------------
+const reinstallRoot = join(LEDGER_DIR, 'reinstall');
+const throwawayHome = join(reinstallRoot, 'home');
+const throwawayDshHome = join(reinstallRoot, 'dsh-home');
+const throwawayPlugin = join(reinstallRoot, 'plugin');
+for (const directory of [throwawayHome, throwawayDshHome, throwawayPlugin]) {
+  ledgerFs.mkdirSync(join(directory, 'nested'), { recursive: true });
+  ledgerFs.writeFileSync(join(directory, 'junk.txt'), 'junk', 'utf8');
+}
+ledgerFs.rmSync(throwawayHome, { recursive: true, force: true });
+ledgerFs.rmSync(throwawayDshHome, { recursive: true, force: true });
+ledgerFs.rmSync(throwawayPlugin, { recursive: true, force: true });
+const survivedReinstall = loadLedgerWithInheritance(canonicalLedgerPath, {
+  env: { DSH_HOME: throwawayDshHome },
+  home: throwawayHome,
+  platform: process.platform,
+});
+check(
+  'ledger reinstall: deleting the Harness home and the plugin dir keeps the totals',
+  ledgerView(survivedReinstall.ledger).totals.total === 950 &&
+    survivedReinstall.imported.length === 0 &&
+    survivedReinstall.wrote === false,
+  JSON.stringify({
+    total: ledgerView(survivedReinstall.ledger).totals.total,
+    imported: survivedReinstall.imported,
+    wrote: survivedReinstall.wrote,
+  }),
+);
+/** Slash-normalised, case-folded path containment, independent of the host. */
+const slashNormalized = (value) => String(value).replace(/\\/g, '/').toLowerCase();
+const insideDirectory = (child, parent) =>
+  slashNormalized(child) === slashNormalized(parent) ||
+  slashNormalized(child).startsWith(slashNormalized(parent).replace(/\/+$/, '') + '/');
+const defaultLedgerPath = resolveLedgerPath({}, throwawayHome, process.platform);
+check(
+  'ledger reinstall: the default ledger path is outside the plugin bundle',
+  !insideDirectory(defaultLedgerPath, BUNDLE) && !insideDirectory(canonicalLedgerPath, BUNDLE),
+  defaultLedgerPath,
+);
+check(
+  'ledger reinstall: the default ledger path does not follow the Harness home',
+  !insideDirectory(defaultLedgerPath, throwawayDshHome) &&
+    defaultLedgerPath !== join(throwawayDshHome, 'usage-ledger', 'ledger.json'),
+  defaultLedgerPath,
 );
 
 // The file layer: atomic write, .bak fallback, and merge-on-save.
@@ -677,6 +1043,91 @@ check(
   written.sessions['session-1'].offset === firstLedger.sessions['session-1'].offset &&
     ledgerView(loadLedgerFile(ledgerFile).ledger).totals.total === ledgerView(firstLedger).totals.total,
   JSON.stringify({ offset: written.sessions['session-1'].offset, total: ledgerView(loadLedgerFile(ledgerFile).ledger).totals.total }),
+);
+
+// A recovery from .bak must not cost the backup. The rescued ledger is written
+// back over the damaged primary, but refreshing .bak from that damaged primary
+// would replace the safety net with the very damage it just rescued — leaving the
+// next crash with nothing to recover from.
+const recoveryFile = join(LEDGER_DIR, 'store', 'recovery', 'ledger.json');
+const backupDocument = fixtureLedger({ 'session-backup': { days: { '2026-10-01': fixtureDay('2026-10-01', 70) } } });
+const rescuedDocument = fixtureLedger({ 'session-rescued': { days: { '2026-10-02': fixtureDay('2026-10-02', 200) } } });
+saveLedgerFile(recoveryFile, backupDocument);
+saveLedgerFile(recoveryFile, backupDocument);
+writeFileSync(recoveryFile, '{ not json', 'utf8');
+const rescuedLoad = loadLedgerFile(recoveryFile);
+saveLedgerFile(recoveryFile, rescuedDocument);
+const rescuedPrimary = loadLedgerFile(recoveryFile);
+let rescuedBackup;
+try {
+  rescuedBackup = normalizeLedger(JSON.parse(readFileSync(recoveryFile + '.bak', 'utf8')));
+} catch {
+  rescuedBackup = undefined;
+}
+check(
+  'ledger store: a save after a .bak recovery keeps the backup readable and good',
+  ledgerView(rescuedLoad.ledger).totals.total === 70 &&
+    rescuedLoad.warnings.length > 0 &&
+    ledgerView(rescuedPrimary.ledger).totals.total === 200 &&
+    rescuedBackup !== undefined &&
+    ledgerView(rescuedBackup).totals.total === 70,
+  JSON.stringify({
+    recovered: ledgerView(rescuedLoad.ledger).totals.total,
+    primary: ledgerView(rescuedPrimary.ledger).totals.total,
+    backup: rescuedBackup === undefined ? 'unparseable' : ledgerView(rescuedBackup).totals.total,
+  }),
+);
+
+// The ordinary path still refreshes the backup: once the primary is a healthy
+// ledger again, a save leaves the previous good primary in .bak.
+const refreshFile = join(LEDGER_DIR, 'store', 'refresh', 'ledger.json');
+const previousDocument = fixtureLedger({ 'session-previous': { days: { '2026-10-01': fixtureDay('2026-10-01', 40) } } });
+const latestDocument = fixtureLedger({ 'session-latest': { days: { '2026-10-02': fixtureDay('2026-10-02', 60) } } });
+saveLedgerFile(refreshFile, previousDocument);
+saveLedgerFile(refreshFile, latestDocument);
+const refreshedPrimary = loadLedgerFile(refreshFile);
+const refreshedBackup = loadLedgerFile(refreshFile + '.bak');
+check(
+  'ledger store: a healthy save still refreshes .bak to the previous primary',
+  ledgerView(refreshedPrimary.ledger).totals.total === 60 &&
+    refreshedBackup.warnings.length === 0 &&
+    ledgerView(refreshedBackup.ledger).totals.total === 40,
+  JSON.stringify({
+    primary: ledgerView(refreshedPrimary.ledger).totals.total,
+    backup: ledgerView(refreshedBackup.ledger).totals.total,
+  }),
+);
+
+// A vanished session has to stay marked once the ledger is persisted. The sync
+// marks goneAt without consuming an event, so the row's lastSeenAt is the only
+// thing that makes merge-on-save keep the mark instead of the on-disk copy that
+// still says goneAt: null — without it the mark is dropped and re-made every sync.
+const goneFile = join(LEDGER_DIR, 'store', 'gone', 'ledger.json');
+const goneStore = fakePersistence().put('session-gone', [attempt(0, 5)]);
+let goneLedger = emptyLedger();
+await syncLedger(goneStore, goneLedger);
+goneStore.drop('session-gone');
+const goneSync = await syncLedger(goneStore, goneLedger);
+goneLedger = saveLedgerMerged(goneFile, goneLedger);
+const goneReloaded = loadLedgerFile(goneFile).ledger;
+check(
+  'ledger store: a gone mark survives the merge-on-save',
+  goneSync.gone === 1 &&
+    typeof goneReloaded.sessions['session-gone']?.goneAt === 'number' &&
+    ledgerView(goneReloaded).live.sessions === 0 &&
+    ledgerView(goneReloaded).totals.total === 5,
+  JSON.stringify({
+    syncGone: goneSync.gone,
+    inMemory: goneLedger.sessions['session-gone']?.goneAt,
+    onDisk: goneReloaded.sessions['session-gone']?.goneAt,
+    live: ledgerView(goneReloaded).live.sessions,
+  }),
+);
+await syncLedger(goneStore, goneLedger);
+check(
+  'ledger store: the persisted gone row stays gone across syncs',
+  ledgerView(goneLedger).live.sessions === 0 && typeof goneLedger.sessions['session-gone']?.goneAt === 'number',
+  JSON.stringify({ live: ledgerView(goneLedger).live.sessions }),
 );
 
 // ---------------------------------------------------------------------------
@@ -985,6 +1436,40 @@ check('the strip renders the ledger caption', ledgerCaptionNode !== undefined);
 check('the caption names the ledger start and its last sync', ledgerBlob.includes('账本自') && ledgerBlob.includes('更新于'), ledgerBlob.slice(0, 240));
 check('the caption prints the on-disk figure and session count', ledgerBlob.includes('1234') && ledgerBlob.includes('149'), ledgerBlob.slice(0, 240));
 check('the caption counts the deleted sessions', ledgerBlob.includes('已删除 3 个会话'), ledgerBlob.slice(0, 240));
+// The tooltip is the only place the file is named, and naming it is what makes
+// "this survives an uninstall" checkable — but a payload without a path must not
+// render an empty second line either.
+const fixtureLedgerFile = join('fixtures', 'dsh-usage', 'ledger.json');
+const captionNote = typeof ledgerCaptionNode?.props?.title === 'string' ? ledgerCaptionNode.props.title : undefined;
+check(
+  'the caption tooltip is just the ledger note when no path is reported',
+  captionNote !== undefined &&
+    captionNote.length > 0 &&
+    !captionNote.includes('\n') &&
+    !captionNote.includes(fixtureLedgerFile),
+  String(captionNote).slice(0, 240),
+);
+const addressedStrip = StatStrip({
+  today: {},
+  totals: {},
+  days: [],
+  available: true,
+  scan: { source: 'ledger', ledgerPath: fixtureLedgerFile },
+});
+let addressedCaptionNode;
+walk(addressedStrip, (node) => {
+  if (typeof node.props?.className === 'string' && node.props.className.includes('dsu-stripLedger')) addressedCaptionNode = node;
+});
+const addressedTitle = addressedCaptionNode?.props?.title;
+check(
+  'the caption tooltip carries the ledger note and the reported file path',
+  typeof addressedTitle === 'string' &&
+    typeof captionNote === 'string' &&
+    addressedTitle.includes(captionNote) &&
+    addressedTitle.includes(fixtureLedgerFile) &&
+    addressedTitle !== captionNote,
+  String(addressedTitle).slice(0, 300),
+);
 const plainStrip = StatStrip({ today: {}, totals: {}, days: [], available: true });
 const plainText = [];
 walk(plainStrip, (node) => {

@@ -50,7 +50,7 @@ HMR. To switch it off, override the row in the profile's own `cordis.patch.yml`:
 | Section | Content |
 |---|---|
 | Overview strip | Today's usage, today's cache hits, all-time usage and cache hits (with the cache share of the prompt), the busiest day, and the current and longest run of days — plus a line naming when the ledger started, when it last synced, and what the logs still on disk add up to |
-| Where "all time" comes from | The cumulative figures come from a local ledger (next section): a deleted session is no longer read, but the usage it already contributed never drops back out |
+| Where "all time" comes from | The cumulative figures come from a local ledger (next section) held in a per-user data directory that survives plugin removal and a DSH reinstall: a deleted session is no longer read, but the usage it already contributed never drops back out |
 | History heatmap | Six months, one cell per day — or per week after switching to **Weekly**. Deeper colour means more usage; hover a cell (or focus it from the keyboard) to float that day's or week's usage and cache hits; click one for the full detail below, and step the window with the arrows |
 | API quotas | `kimi-coding` (5-hour window, monthly total), `commandcode` (5-hour, weekly, monthly) and `opencode-go` (rolling 5-hour, weekly, monthly) used share and reset times |
 
@@ -65,12 +65,38 @@ Token counts are always shown as **complete integers** — never abbreviated to 
 ## Cumulative usage and the ledger
 
 The all-time figures are not "add up whatever logs exist right now" — they are kept in a
-local ledger:
+local ledger. It lives in the **per-user operating-system data directory**, deliberately not in
+the plugin directory and not in the DSH home: both can be removed or replaced when something is
+uninstalled, while the usage history is meant to outlive them:
 
 ```text
-<DSH_HOME>/usage-ledger/ledger.json       # ~/.dsh/usage-ledger/ledger.json by default
-<DSH_HOME>/usage-ledger/ledger.json.bak   # the previous successful write
+Windows   %LOCALAPPDATA%\dsh-usage\ledger.json      # falls back to %APPDATA%, then %USERPROFILE%\AppData\Local
+macOS     ~/Library/Application Support/dsh-usage/ledger.json
+Linux     $XDG_DATA_HOME/dsh-usage/ledger.json      # ~/.local/share/dsh-usage/ledger.json by default
 ```
+
+Two other files sit beside it:
+
+```text
+ledger.json.bak   the previous successful write
+imported.json     a record of which old ledgers were merged (each file's size + mtime)
+```
+
+`DSH_USAGE_LEDGER` still overrides the location, as a **complete file path**; `DSH_HOME` no
+longer moves the ledger, and neither does a profile setting.
+
+**Uninstalling does not take the ledger with it.** Removing the bundle, or uninstalling or
+reinstalling DSH, never automatically removes this directory, so the next install reads the
+same file and carries on: a DSH reinstall opens a new home with new sessions, the old rows stay
+credited (marked gone) and new sessions are added, so the totals never go backwards.
+
+An upgrade from 1.5.0 or earlier **merges** the ledger left at the old location into this one,
+without moving or deleting the original: `$DSH_HOME/usage-ledger/ledger.json` and
+`~/.dsh/usage-ledger/ledger.json` (the same file when `DSH_HOME` is unset; both homes are
+checked when it points elsewhere). The merge keeps, per session, the row that consumed more
+events and the earliest start; `imported.json` records each old file's size and modification
+time, so one version is imported once — if an older Harness advances that file again, the next
+load merges it again.
 
 One row per session, holding the day buckets it has contributed and how far into its log
 that contribution has been read. Therefore:
@@ -93,10 +119,13 @@ that contribution has been read. Therefore:
 
 The `on disk now` line under the strip is the same merge restricted to sessions whose logs
 are still there. The difference between the two numbers is exactly the sessions that were
-deleted but are still remembered.
+deleted but are still remembered. Hovering that line shows the ledger file's full path and
+says that removing the plugin or reinstalling DSH will not lose it.
 
 Deleting `ledger.json` and `ledger.json.bak` resets the ledger (the total then restarts
-from what is on disk).
+from what is on disk). `imported.json` keeps the old ledgers out, so the pre-upgrade history
+does not grow back when the new files are deleted; delete it too only if you deliberately
+want the old ledgers imported again.
 
 ### Seeding or backfilling without Harness running
 
@@ -107,6 +136,8 @@ directory of session logs:
 node tools/seed-ledger.mjs                      # build / advance from this machine's logs
 node tools/seed-ledger.mjs --backfill --from <a backed-up sessions directory>
 ```
+
+It uses the same default path as the panel and inherits the old ledgers too.
 
 `--backfill` is **add-only**: sessions present in the backup but absent from the ledger are
 credited as already-gone rows (no session file is copied or restored), while ids the ledger
@@ -172,8 +203,10 @@ package.json       bundle manifest (dsh.bundle.patch + dsh.client)
 cordis.patch.yml   one insert row: mounts the host half
 index.js           host half: /api/usage/usage, /api/usage/quota, /api/usage/report
 client.js          browser half: the settings.section page (build-free lazy CJS bundle)
-lib/ledger.js      the incremental ledger: fold, sync, merge, atomic read/write
+lib/ledger.js      the incremental ledger: fold, sync, merge, atomic read/write, path
+                   resolution and inheritance of the old ledgers
 tools/seed-ledger.mjs  build the ledger, or backfill it from a backup, without Harness
+                   (same default path)
 icon.svg           bundle icon
 locale/*.json      plugin-manager title and description
 docs/              panel shots produced by test/preview.mjs, the ledger design note,
@@ -210,6 +243,10 @@ full fold, an unchanged session is never opened, growth is credited exactly once
 never lowers the total, a restored session resumes from its offset, a shorter or reordered log
 only warns, two ledgers merge towards the row that read further, a corrupt file falls back to
 `.bak`, and the strip's ledger caption renders.
+1.6.0 adds the storage and inheritance assertions on top: the default path on all three
+platforms, the `DSH_USAGE_LEDGER` override, `DSH_HOME` no longer moving the ledger, an old
+ledger being imported only once, a reset not resurrecting old history, and the totals surviving
+a simulated plugin removal plus DSH reinstall.
 The browser half additionally asserts the heatmap's window, week columns, ISO weeks, shades,
 weekly aggregation and day runs, plus the rendered grid's cell count, `aria-label`s, legend
 and toggles. Exit code 0 means all checks passed.

@@ -8,9 +8,14 @@
 #   - id: usage-panel
 #     disabled: true
 #
-# The cumulative figures come from an append-only ledger under
-# `$DSH_HOME/usage-ledger/`, advanced in the background every `syncIntervalMs`
-# (default 600000 = 10 minutes, floor 60000):
+# The cumulative figures come from an append-only ledger in the per-user data
+# directory (`%LOCALAPPDATA%\dsh-usage\ledger.json` on Windows,
+# `~/Library/Application Support/dsh-usage/ledger.json` on macOS,
+# `~/.local/share/dsh-usage/ledger.json` on Linux). It lives outside both the
+# plugin and the Harness home, so uninstalling the plugin or reinstalling DSH
+# keeps the history; a pre-1.6 ledger under `$DSH_HOME/usage-ledger/` is merged
+# in once on load and left untouched. Advanced in the background every
+# `syncIntervalMs` (default 600000 = 10 minutes, floor 60000):
 #
 #   - id: usage-panel
 #     config:
