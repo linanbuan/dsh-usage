@@ -4,33 +4,63 @@
 
 > DeepSeek Harness (DSH) 设置面板里的 **用量** 页：当天与累计的 token 用量、缓存命中、
 > 近六个月的热力图，以及本 Harness 已接入 API 的额度与刷新时间。
+> 累计账本存在**每用户数据目录**，卸载插件或重装 DSH 都不会丢。
 
 ![用量面板](docs/panel-light.png)
 
 插件注册在 `settings.section`，名为「用量」，排在 **Agent 预设** 下面，图标为自绘的三柱折线。
 
+## 最近更新（1.6.0）
+
+- 账本迁到**每用户数据目录**（Windows `%LOCALAPPDATA%\dsh-usage\`，macOS `~/Library/Application Support/dsh-usage/`，
+  Linux `$XDG_DATA_HOME/dsh-usage/`）：卸载插件、卸载或重装 DSH 都不会删除，下次安装自动继承。
+- 首次加载把 1.5.0 旧账本（`$DSH_HOME/usage-ledger/`）合并进来，旧文件原样保留。
+- 另修「已删除会话」标记没写进账本、导致计数偏小的问题。
+
 ## 先装 DSH 桌面端
 
-本插件住在 Harness 里，所以先把桌面端装上：到 [deepseek.com/download](https://www.deepseek.com/download/)
-下载 **DeepSeek Harness 桌面端**，官方同页提供 macOS 版（Apple 芯片、macOS 13 及以上）与 Windows 版；
-产品介绍见 [deepseek.com/harness](https://www.deepseek.com/harness/)（官方标注预览版）。
-它支持后台运行与本地文件读写——本面板折叠出来的用量数字，就来自它写在本机会话日志里的记录。
+本插件住在 Harness 里，所以先把桌面端装上。官方下载页是
+[deepseek.com/download](https://www.deepseek.com/download/)，页面里的 **DeepSeek Harness 桌面端** 提供：
+
+| 平台 | 安装包 | 要求 |
+|---|---|---|
+| macOS | [dsh-latest-macos-arm64.dmg](https://download.deepseek.com/desktop/dsh-latest-macos-arm64.dmg) | Apple 芯片、macOS 13 或更高版本（Intel 芯片暂不支持） |
+| Windows | [dsh-latest-windows-x64.exe](https://download.deepseek.com/desktop/dsh-latest-windows-x64.exe) | 64 位 Windows |
+
+产品介绍见 [deepseek.com/harness](https://www.deepseek.com/harness/)；源码、文档与快速开始见
+[GitHub · deepseek-ai/deepseek-harness](https://github.com/deepseek-ai/deepseek-harness) 与
+[guide/quickstart](https://deepseek-harness.github.io/deepseek-harness/guide/quickstart)。
+桌面端支持后台运行与本地文件读写——本面板折叠出来的用量数字，就来自它写在本机会话日志里的记录。
 
 ## 安装
 
-这是一个标准的 DSH bundle（`package.json` 里声明了 `dsh.bundle.patch` 与 `dsh.client`）。
-把本目录放到任意位置，然后在 DSH 里装进当前 profile：
+这是一个标准的 DSH bundle（`package.json` 里声明了 `dsh.bundle.patch` 与 `dsh.client`），
+可以直接从 GitHub 装进桌面端，不用先手动下载插件包：
+
+1. 打开 **DSH 桌面端** → 左侧 **插件** → **添加插件** → **安装第三方插件**；
+2. 在「包名或地址」里填本仓库地址 `https://github.com/linanbuan/dsh-usage`
+   （这个输入框也接受 npm 包名与本地目录的绝对路径）；
+3. 点 **安装**，按提示**重启 DSH** 让 Host 半加载。
+
+也可以先把仓库取到本机，再把**解压目录的绝对路径**填进同一个输入框：
+
+```bash
+git clone https://github.com/linanbuan/dsh-usage.git
+# 或者在 GitHub 页面点 Code → Download ZIP，解压后使用解压目录
+```
+
+在会话里让 Agent 安装、或在已配置 `dsh` 命令的终端里安装，也都是等价方式：
 
 ```text
 plugin_manager   action: install_bundle   target: <本目录的绝对路径>
 ```
 
-它会执行 pnpm 置入并把 `@local/dsh-usage` 写进 profile 的 `dsh.profile.bundles`。
-等价的手工方式：
-
 ```bash
 dsh plugin --profile <你的 profile> add <本目录的绝对路径>
 ```
+
+它会执行 pnpm 置入并把 `@local/dsh-usage` 写进 profile 的 `dsh.profile.bundles`。
+从 1.5.0 升级时请先卸载旧版再安装新版（第三方插件不支持原地更新）；旧账本会在第一次启动时自动继承。
 
 装好后 **Host 半需要重启 Harness 才生效**（Host 模块走 Node 的 ESM 缓存，不参与 HMR）；
 浏览器半由 HMR 立刻更新。想关掉它，在 profile 自己的 `cordis.patch.yml` 里覆盖这一行：

@@ -4,37 +4,67 @@
 
 > A **Usage** page inside the DeepSeek Harness (DSH) settings panel: token usage and
 > cache hits for today and all time, a six-month heatmap, and the quotas and reset
-> times of the APIs wired into this Harness.
+> times of the APIs wired into this Harness. The cumulative ledger lives in the
+> per-user data directory, so removing the plugin or reinstalling DSH does not lose it.
 
 ![Usage panel](docs/panel-light.png)
 
 The plugin registers one `settings.section` named 用量 (Usage), placed directly below
 **Agent 预设** (Agent presets), with its own hand-drawn bar-chart glyph.
 
+## What's new (1.6.0)
+
+- The ledger now lives in the **per-user data directory** (Windows `%LOCALAPPDATA%\dsh-usage\`,
+  macOS `~/Library/Application Support/dsh-usage/`, Linux `$XDG_DATA_HOME/dsh-usage/`): removing the plugin,
+  uninstalling or reinstalling DSH no longer deletes it, and the next install inherits it.
+- On first load a 1.5.0 ledger from `$DSH_HOME/usage-ledger/` is merged in; the old files are left untouched.
+- Also fixes the deleted-session marker not reaching the ledger file, which under-counted the deleted-session figure.
+
 ## Install the DSH desktop first
 
-The plugin lives inside Harness, so the desktop app comes first: download the
-**DeepSeek Harness desktop** from [deepseek.com/download](https://www.deepseek.com/download/),
-which serves the macOS build (Apple silicon, macOS 13 or later) and the Windows build;
-[deepseek.com/harness](https://www.deepseek.com/harness/) describes the product (the
-site labels it a preview). It runs in the background and reads local files — the usage
-figures this panel folds come out of the session logs it keeps on this machine.
+The plugin lives inside Harness, so the desktop app comes first. The official download page is
+[deepseek.com/download](https://www.deepseek.com/download/); its **DeepSeek Harness desktop** section offers:
+
+| Platform | Installer | Requirement |
+|---|---|---|
+| macOS | [dsh-latest-macos-arm64.dmg](https://download.deepseek.com/desktop/dsh-latest-macos-arm64.dmg) | Apple silicon, macOS 13 or later (Intel chips are not supported) |
+| Windows | [dsh-latest-windows-x64.exe](https://download.deepseek.com/desktop/dsh-latest-windows-x64.exe) | 64-bit Windows |
+
+The product page is [deepseek.com/harness](https://www.deepseek.com/harness/); the source, docs and quick start live at
+[GitHub · deepseek-ai/deepseek-harness](https://github.com/deepseek-ai/deepseek-harness) and
+[guide/quickstart](https://deepseek-harness.github.io/deepseek-harness/en/guide/quickstart).
+It runs in the background and reads local files — the usage figures this panel folds come out of the session logs it keeps on this machine.
 
 ## Install
 
-This is a standard DSH bundle (`package.json` declares `dsh.bundle.patch` and
-`dsh.client`). Put this directory anywhere and install it into the current profile:
+This is a standard DSH bundle (`package.json` declares `dsh.bundle.patch` and `dsh.client`),
+and the desktop app can install it straight from GitHub — no manual plugin download needed:
+
+1. Open the **DSH desktop** → **Plugins** in the sidebar → **Add plugin** → **Install third-party plugin**;
+2. Enter this repository's URL in "Package name or address": `https://github.com/linanbuan/dsh-usage`
+   (the field also accepts npm package names and absolute local directory paths);
+3. Click **Install** and **restart DSH** when prompted so the host half loads.
+
+You can also fetch the repo first and enter the **absolute path** of the unzipped directory instead:
+
+```bash
+git clone https://github.com/linanbuan/dsh-usage.git
+# or on GitHub: Code → Download ZIP, then unzip
+```
+
+Installing through an agent session, or through a terminal that has the `dsh` command, is equivalent:
 
 ```text
 plugin_manager   action: install_bundle   target: <absolute path to this directory>
 ```
 
-That runs the pnpm install and writes `@local/dsh-usage` into the profile's
-`dsh.profile.bundles`. The equivalent manual form:
-
 ```bash
 dsh plugin --profile <your profile> add <absolute path to this directory>
 ```
+
+That runs the pnpm install and writes `@local/dsh-usage` into the profile's `dsh.profile.bundles`.
+When upgrading from 1.5.0, uninstall the old version before installing this one (third-party plugins are
+not updated in place); the old ledger is inherited automatically on the first start.
 
 The **host half needs a Harness restart** to activate (host modules go through Node's
 ESM cache and do not participate in HMR); the browser half updates immediately through
